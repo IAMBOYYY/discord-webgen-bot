@@ -11,7 +11,7 @@ from openai import AsyncOpenAI, RateLimitError, APIStatusError
 import aiohttp
 
 # -------------------------------------------------------------------
-# Configuration from environment
+# Configuration
 # -------------------------------------------------------------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 OPENROUTER_API_BASE = os.getenv("OPENROUTER_API_BASE", "https://openrouter.ai/api/v1")
@@ -19,6 +19,10 @@ OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "auto")
 PORT = int(os.getenv("PORT", 8000))
 RETRY_LIMIT = 5
 BASE_DELAY = 2
+
+# HTML quality thresholds
+MIN_HTML_LENGTH = 100   # at least 100 characters
+REQUIRED_TAGS = ["<html", "<head", "<body"]   # must contain these
 
 # -------------------------------------------------------------------
 # Persistent user keys
@@ -104,12 +108,10 @@ async def fetch_best_free_model(api_key: str) -> str:
     return FALLBACK_MODEL
 
 # -------------------------------------------------------------------
-# HTTP server (proper file serving + health check)
+# HTTP server
 # -------------------------------------------------------------------
 class RequestHandler(SimpleHTTPRequestHandler):
-    """Custom handler that serves files from SITES_DIR and responds to /health."""
     def __init__(self, *args, **kwargs):
-        # Force directory to generated_sites
         super().__init__(*args, directory=str(SITES_DIR), **kwargs)
 
     def do_GET(self):
@@ -119,7 +121,7 @@ class RequestHandler(SimpleHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b"OK")
         else:
-            super().do_GET()   # serves index.html, etc.
+            super().do_GET()
 
 def start_http_server():
     server = HTTPServer(("0.0.0.0", PORT), RequestHandler)
@@ -156,7 +158,20 @@ async def set_key(ctx, key: str):
         await ctx.send("✅ OpenRouter API key saved securely.")
 
 # -------------------------------------------------------------------
-# Website generation
+# HTML validation
+# -------------------------------------------------------------------
+def is_valid_html(html: str) -> bool:
+    """Check that the HTML is long enough and contains basic tags."""
+    if len(html) < MIN_HTML_LENGTH:
+        return False
+    html_lower = html.lower()
+    for tag in REQUIRED_TAGS:
+        if tag not in html_lower:
+            return False
+    return True
+
+# -------------------------------------------------------------------
+# Website generation (with quality retries)
 # -------------------------------------------------------------------
 @bot.command(name="make")
 async def make_website(ctx, *, description: str):
@@ -189,56 +204,79 @@ async def make_website(ctx, *, description: str):
         }
     )
 
+    # Stronger system prompt to ensure visible content
     system_prompt = (
-        "You are a web developer. Generate a complete single‑file HTML website "
-        "with inline CSS and JavaScript. Reply ONLY with the raw HTML code "
-        "(no markdown, no explanations). It must be a valid HTML5 document."
+        "You are a professional web developer. Your task is to generate a COMPLETE, fully styled single‑file HTML website "
+        "based on the user's description. Follow these rules strictly:\n\n"
+        "- Include <!DOCTYPE html>, <html>, <head> with <meta charset='UTF-8'>, a meaningful <title>, "
+        "and all necessary meta tags for responsive design.\n"
+        "- Inline CSS must make the page visually appealing with a clear colour scheme (NOT white text on white background). "
+        "Use a modern, accessible colour palette. The page must be immediately visible and readable.\n"
+        "- The <body> MUST contain at least one visible <h1> heading and one <p> paragraph that match the request.\n"
+        "- Do NOT output only a script or a blank page. The HTML must render meaningful content even if JavaScript is disabled.\n"
+        "- Respond ONLY with the raw HTML code. Do not wrap it in markdown fences (no ```).\n"
+        "- Do not include any explanations or apologies. Output only the HTML."
     )
+
     user_prompt = f"Create a website: {description}"
 
-    for attempt in range(1, RETRY_LIMIT + 1):
-        async with ctx.typing():
-            try:
-                response = await client.chat.completions.create(
-                    model=model_to_use,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    temperature=0.7,
-                    max_tokens=4096,
-                )
-                html_code = response.choices[0].message.content.strip()
-                if html_code.startswith("```html"):
-                    html_code = html_code[7:-3].strip()
-                elif html_code.startswith("```"):
-                    html_code = html_code[3:-3].strip()
+    # Generation attempt loop (max 3 tries for quality)
+    for gen_attempt in range(3):
+        for attempt in range(1, RETRY_LIMIT + 1):
+            async with ctx.typing():
+                try:
+                    response = await client.chat.completions.create(
+                        model=model_to_use,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                        temperature=0.7,
+                        max_tokens=4096,
+                    )
+                    html_code = response.choices[0].message.content.strip()
 
-                (SITES_DIR / "index.html").write_text(html_code, encoding="utf-8")
-                render_url = os.getenv("RENDER_EXTERNAL_URL", f"http://localhost:{PORT}")
+                    # Clean up any markdown code fences
+                    if html_code.startswith("```html"):
+                        html_code = html_code[7:-3].strip()
+                    elif html_code.startswith("```"):
+                        html_code = html_code[3:-3].strip()
 
-                await ctx.send(
-                    f"✅ Website generated!\n"
-                    f"🌐 Public link: {render_url}\n"
-                    f"🔄 Use `!make` again to update it."
-                )
-                return
+                    # Validate the output
+                    if is_valid_html(html_code):
+                        (SITES_DIR / "index.html").write_text(html_code, encoding="utf-8")
+                        render_url = os.getenv("RENDER_EXTERNAL_URL", f"http://localhost:{PORT}")
+                        await ctx.send(
+                            f"✅ Website generated!\n"
+                            f"🌐 Public link: {render_url}\n"
+                            f"🔄 Use `!make` again to update it."
+                        )
+                        return
+                    else:
+                        # Invalid HTML – warn and retry
+                        if gen_attempt == 2:
+                            await ctx.send("❌ After multiple attempts, the generated page was still blank or invalid. Please try a different description.")
+                            return
+                        await ctx.send("⚠️ Generated page appears blank. Retrying with stricter instructions…")
+                        # Update prompt to be even more explicit
+                        user_prompt = f"Create a complete, visible website with at least a heading and paragraph. Original request: {description}"
+                        break   # exit inner retry loop, go to next gen_attempt
 
-            except RateLimitError:
-                if attempt == RETRY_LIMIT:
-                    await ctx.send("❌ Still hitting rate limits after several retries. Please try again later.")
+                except RateLimitError:
+                    if attempt == RETRY_LIMIT:
+                        await ctx.send("❌ Still hitting rate limits after several retries. Please try again later.")
+                        return
+                    wait = BASE_DELAY * (2 ** (attempt - 1))
+                    await ctx.send(f"⏳ Rate limited. Retrying in {wait} seconds… (attempt {attempt}/{RETRY_LIMIT})")
+                    await asyncio.sleep(wait)
+
+                except APIStatusError as e:
+                    await ctx.send(f"❌ API error: {e.status_code} – {e.message}")
                     return
-                wait = BASE_DELAY * (2 ** (attempt - 1))
-                await ctx.send(f"⏳ Rate limited. Retrying in {wait} seconds… (attempt {attempt}/{RETRY_LIMIT})")
-                await asyncio.sleep(wait)
 
-            except APIStatusError as e:
-                await ctx.send(f"❌ API error: {e.status_code} – {e.message}")
-                return
-
-            except Exception as e:
-                await ctx.send(f"❌ Unexpected error: {str(e)}")
-                return
+                except Exception as e:
+                    await ctx.send(f"❌ Unexpected error: {str(e)}")
+                    return
 
 # -------------------------------------------------------------------
 # Start bot
