@@ -2,7 +2,7 @@ import os
 import json
 import asyncio
 import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler, SimpleHTTPRequestHandler
+from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 
 import discord
@@ -15,7 +15,7 @@ import aiohttp
 # -------------------------------------------------------------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 OPENROUTER_API_BASE = os.getenv("OPENROUTER_API_BASE", "https://openrouter.ai/api/v1")
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "auto")  # "auto" triggers auto-pick
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "auto")
 PORT = int(os.getenv("PORT", 8000))
 RETRY_LIMIT = 5
 BASE_DELAY = 2
@@ -49,27 +49,20 @@ SITES_DIR.mkdir(exist_ok=True)
 # -------------------------------------------------------------------
 # Auto model selection
 # -------------------------------------------------------------------
-# Priority order for free models (must match exact OpenRouter IDs)
 MODEL_PRIORITY = [
     "google/gemma-2-9b-it",
     "meta-llama/llama-3-8b-instruct",
     "mistralai/mistral-7b-instruct",
     "meta-llama/llama-3-8b",
     "mistralai/mistral-7b",
-    "google/gemini-2.0-flash-001",   # sometimes free
+    "google/gemini-2.0-flash-001",
 ]
 FALLBACK_MODEL = "google/gemma-2-9b-it"
 
-# Global selected model (initially None -> auto mode)
 selected_model = None
 model_lock = asyncio.Lock()
 
 async def fetch_best_free_model(api_key: str) -> str:
-    """
-    Uses api_key to call OpenRouter's /models endpoint,
-    picks the best free model from the priority list.
-    Returns the model ID (string).
-    """
     headers = {
         "Authorization": f"Bearer {api_key}",
         "HTTP-Referer": "https://discord.com",
@@ -87,49 +80,49 @@ async def fetch_best_free_model(api_key: str) -> str:
             print(f"Failed to fetch models: {e}")
             return FALLBACK_MODEL
 
-    # Filter free models (both prompt and completion cost 0)
     free_models = []
     for model in data.get("data", []):
         pricing = model.get("pricing", {})
         prompt_price = pricing.get("prompt", "0")
         completion_price = pricing.get("completion", "0")
-        # prices are strings like "0" or "0.000001"
         try:
             if float(prompt_price) == 0 and float(completion_price) == 0:
                 free_models.append(model["id"])
         except (ValueError, KeyError):
             continue
 
-    # Pick the first matching from our priority list
     for model_id in MODEL_PRIORITY:
         if model_id in free_models:
             print(f"Auto-selected model: {model_id}")
             return model_id
 
-    # If none matched, return any free model (first one)
     if free_models:
         fallback = free_models[0]
         print(f"No priority model found, using first free: {fallback}")
         return fallback
 
-    # Last resort: hardcoded fallback
     return FALLBACK_MODEL
 
 # -------------------------------------------------------------------
-# HTTP server (health check + file serving)
+# HTTP server (proper file serving + health check)
 # -------------------------------------------------------------------
-class HealthHandler(BaseHTTPRequestHandler):
+class RequestHandler(SimpleHTTPRequestHandler):
+    """Custom handler that serves files from SITES_DIR and responds to /health."""
+    def __init__(self, *args, **kwargs):
+        # Force directory to generated_sites
+        super().__init__(*args, directory=str(SITES_DIR), **kwargs)
+
     def do_GET(self):
         if self.path == "/health":
             self.send_response(200)
+            self.send_header("Content-type", "text/plain")
             self.end_headers()
             self.wfile.write(b"OK")
         else:
-            self.directory = str(SITES_DIR)
-            return SimpleHTTPRequestHandler.do_GET(self)
+            super().do_GET()   # serves index.html, etc.
 
 def start_http_server():
-    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+    server = HTTPServer(("0.0.0.0", PORT), RequestHandler)
     print(f"🌐 Web server running on port {PORT}")
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
@@ -150,7 +143,6 @@ def get_user_key(user_id: str) -> str | None:
 
 @bot.command(name="setkey")
 async def set_key(ctx, key: str):
-    """Store your OpenRouter API key (free). Use in DM."""
     uid = str(ctx.author.id)
     user_keys[uid] = key
     save_user_keys()
@@ -164,11 +156,10 @@ async def set_key(ctx, key: str):
         await ctx.send("✅ OpenRouter API key saved securely.")
 
 # -------------------------------------------------------------------
-# Core website generation (with auto‑model)
+# Website generation
 # -------------------------------------------------------------------
 @bot.command(name="make")
 async def make_website(ctx, *, description: str):
-    """Generate a website from text and host it publicly."""
     uid = str(ctx.author.id)
     api_key = get_user_key(uid)
     if not api_key:
@@ -180,19 +171,15 @@ async def make_website(ctx, *, description: str):
         return
 
     global selected_model
-
-    # Auto‑select the model if needed
     if OPENROUTER_MODEL == "auto" and selected_model is None:
         async with model_lock:
-            if selected_model is None:  # double check
+            if selected_model is None:
                 await ctx.send("🔍 Finding the best free model for you…", delete_after=5)
                 selected_model = await fetch_best_free_model(api_key)
                 print(f"Auto model set to: {selected_model}")
 
-    # Determine which model to use
     model_to_use = OPENROUTER_MODEL if OPENROUTER_MODEL != "auto" else selected_model
 
-    # Build client
     client = AsyncOpenAI(
         api_key=api_key,
         base_url=OPENROUTER_API_BASE,
@@ -209,7 +196,6 @@ async def make_website(ctx, *, description: str):
     )
     user_prompt = f"Create a website: {description}"
 
-    # Retry loop for rate limits
     for attempt in range(1, RETRY_LIMIT + 1):
         async with ctx.typing():
             try:
@@ -223,7 +209,6 @@ async def make_website(ctx, *, description: str):
                     max_tokens=4096,
                 )
                 html_code = response.choices[0].message.content.strip()
-                # Strip fences
                 if html_code.startswith("```html"):
                     html_code = html_code[7:-3].strip()
                 elif html_code.startswith("```"):
@@ -256,7 +241,7 @@ async def make_website(ctx, *, description: str):
                 return
 
 # -------------------------------------------------------------------
-# Start
+# Start bot
 # -------------------------------------------------------------------
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
