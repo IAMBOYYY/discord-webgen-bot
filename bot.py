@@ -20,9 +20,9 @@ PORT = int(os.getenv("PORT", 8000))
 RETRY_LIMIT = 5
 BASE_DELAY = 2
 
-# HTML quality thresholds
-MIN_HTML_LENGTH = 100   # at least 100 characters
-REQUIRED_TAGS = ["<html", "<head", "<body"]   # must contain these
+# HTML quality
+MIN_HTML_LENGTH = 100
+REQUIRED_TAGS = ["<html", "<head", "<body"]
 
 # -------------------------------------------------------------------
 # Persistent user keys
@@ -161,7 +161,6 @@ async def set_key(ctx, key: str):
 # HTML validation
 # -------------------------------------------------------------------
 def is_valid_html(html: str) -> bool:
-    """Check that the HTML is long enough and contains basic tags."""
     if len(html) < MIN_HTML_LENGTH:
         return False
     html_lower = html.lower()
@@ -171,7 +170,7 @@ def is_valid_html(html: str) -> bool:
     return True
 
 # -------------------------------------------------------------------
-# Website generation (with quality retries)
+# Website generation
 # -------------------------------------------------------------------
 @bot.command(name="make")
 async def make_website(ctx, *, description: str):
@@ -204,23 +203,20 @@ async def make_website(ctx, *, description: str):
         }
     )
 
-    # Stronger system prompt to ensure visible content
+    # Base system prompt
     system_prompt = (
-        "You are a professional web developer. Your task is to generate a COMPLETE, fully styled single‑file HTML website "
-        "based on the user's description. Follow these rules strictly:\n\n"
-        "- Include <!DOCTYPE html>, <html>, <head> with <meta charset='UTF-8'>, a meaningful <title>, "
-        "and all necessary meta tags for responsive design.\n"
-        "- Inline CSS must make the page visually appealing with a clear colour scheme (NOT white text on white background). "
-        "Use a modern, accessible colour palette. The page must be immediately visible and readable.\n"
-        "- The <body> MUST contain at least one visible <h1> heading and one <p> paragraph that match the request.\n"
-        "- Do NOT output only a script or a blank page. The HTML must render meaningful content even if JavaScript is disabled.\n"
-        "- Respond ONLY with the raw HTML code. Do not wrap it in markdown fences (no ```).\n"
-        "- Do not include any explanations or apologies. Output only the HTML."
+        "You are a professional web developer. Generate a COMPLETE, single‑file HTML website "
+        "with visible text content, CSS styling, and proper structure. "
+        "Rules:\n"
+        "- Include <!DOCTYPE html>, <html>, <head> with <title> and meta charset.\n"
+        "- Use inline CSS to make the page attractive (dark text on light bg or similar).\n"
+        "- The <body> MUST contain at least one <h1> and one <p> with meaningful content.\n"
+        "- Do NOT output an empty page or only a script. The page must render content without JavaScript.\n"
+        "- Output ONLY the raw HTML. No markdown, no explanations."
     )
 
     user_prompt = f"Create a website: {description}"
 
-    # Generation attempt loop (max 3 tries for quality)
     for gen_attempt in range(3):
         for attempt in range(1, RETRY_LIMIT + 1):
             async with ctx.typing():
@@ -234,15 +230,21 @@ async def make_website(ctx, *, description: str):
                         temperature=0.7,
                         max_tokens=4096,
                     )
-                    html_code = response.choices[0].message.content.strip()
 
-                    # Clean up any markdown code fences
+                    # Extract content safely
+                    content = response.choices[0].message.content
+                    if content is None:
+                        raise ValueError("Model returned empty content (None).")
+
+                    html_code = content.strip()
+
+                    # Clean code fences
                     if html_code.startswith("```html"):
                         html_code = html_code[7:-3].strip()
                     elif html_code.startswith("```"):
                         html_code = html_code[3:-3].strip()
 
-                    # Validate the output
+                    # Validate
                     if is_valid_html(html_code):
                         (SITES_DIR / "index.html").write_text(html_code, encoding="utf-8")
                         render_url = os.getenv("RENDER_EXTERNAL_URL", f"http://localhost:{PORT}")
@@ -253,18 +255,26 @@ async def make_website(ctx, *, description: str):
                         )
                         return
                     else:
-                        # Invalid HTML – warn and retry
+                        # Invalid HTML – retry with stricter prompt
                         if gen_attempt == 2:
-                            await ctx.send("❌ After multiple attempts, the generated page was still blank or invalid. Please try a different description.")
+                            await ctx.send("❌ After several attempts, the page was still blank. Please try a more specific description.")
                             return
-                        await ctx.send("⚠️ Generated page appears blank. Retrying with stricter instructions…")
-                        # Update prompt to be even more explicit
-                        user_prompt = f"Create a complete, visible website with at least a heading and paragraph. Original request: {description}"
-                        break   # exit inner retry loop, go to next gen_attempt
+                        await ctx.send("⚠️ Page appears blank, retrying with clearer instructions…")
+                        user_prompt = f"Create a full, visible website with at least one heading and one paragraph about: {description}"
+                        break  # exit inner loop, go to next gen_attempt
+
+                except ValueError as ve:
+                    # Empty content – treat as quality failure
+                    if gen_attempt == 2:
+                        await ctx.send("❌ The model repeatedly returned empty content. Try a different description or model.")
+                        return
+                    await ctx.send("⚠️ Model returned empty response, retrying…")
+                    user_prompt = f"Please output ONLY valid HTML code for a website about: {description}"
+                    break
 
                 except RateLimitError:
                     if attempt == RETRY_LIMIT:
-                        await ctx.send("❌ Still hitting rate limits after several retries. Please try again later.")
+                        await ctx.send("❌ Still hitting rate limits. Please try again later.")
                         return
                     wait = BASE_DELAY * (2 ** (attempt - 1))
                     await ctx.send(f"⏳ Rate limited. Retrying in {wait} seconds… (attempt {attempt}/{RETRY_LIMIT})")
