@@ -150,7 +150,7 @@ async def startup_cleanup():
 # -------------------------------------------------------------------
 intents = discord.Intents.default()
 intents.message_content = True
-intents.members = True  # needed for online count in server info
+# intents.members is left at default (False)
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
@@ -389,7 +389,7 @@ def is_server_question(question: str) -> bool:
 
 def get_server_info(guild: discord.Guild) -> str:
     member_count = guild.member_count
-    online = sum(1 for m in guild.members if m.status != discord.Status.offline)
+    online = "not available (intent disabled)"
     text_channels = len(guild.text_channels)
     voice_channels = len(guild.voice_channels)
     roles = ", ".join([r.name for r in guild.roles[:10]])
