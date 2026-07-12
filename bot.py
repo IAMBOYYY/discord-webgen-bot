@@ -5,7 +5,6 @@ import threading
 import shutil
 import uuid
 import time
-from datetime import datetime, timedelta
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 
@@ -36,7 +35,7 @@ PROVIDERS = {
     "groq": {
         "name": "Groq",
         "base_url": "https://api.groq.com/openai/v1",
-        "default_model": "llama-3.1-8b-instant",  # current as of 2025
+        "default_model": "llama-3.1-8b-instant",
     },
     "nvidia": {
         "name": "NVIDIA NIM",
@@ -396,6 +395,7 @@ async def show_provider(ctx):
 # -------------------------------------------------------------------
 @bot.command(name="ask")
 async def ask_question(ctx, *, question: str):
+    """Ask any question – the bot answers using your AI provider."""
     uid = str(ctx.author.id)
     client = get_user_client(uid)
     if not client:
@@ -416,10 +416,11 @@ async def ask_question(ctx, *, question: str):
             await ctx.send(f"❌ Error: {str(e)}")
 
 # -------------------------------------------------------------------
-# Workspace / project commands (unchanged but use the user's model)
+# Workspace / project commands
 # -------------------------------------------------------------------
 @bot.command(name="newproject")
 async def new_project(ctx):
+    """Create a new empty project and set it as your active one."""
     uid = str(ctx.author.id)
     proj_name = f"proj_{uuid.uuid4().hex[:8]}"
     proj_path = WORKSPACE_DIR / proj_name
@@ -436,6 +437,7 @@ async def new_project(ctx):
 
 @bot.command(name="make")
 async def make_website(ctx, *, description: str):
+    """Generate/update the website in your current project using AI tools."""
     uid = str(ctx.author.id)
     if uid not in user_data or not user_data[uid].get("current_project"):
         await ctx.send("❌ No active project. Use `!newproject`.")
@@ -453,12 +455,12 @@ async def make_website(ctx, *, description: str):
             "type": "function",
             "function": {
                 "name": "create_file",
-                "description": "Create a new file in the project with given content.",
+                "description": "Create a new file with given content in the project.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "filename": {"type": "string", "description": "Relative path, e.g., 'index.html'"},
-                        "content": {"type": "string", "description": "Full file content"},
+                        "content": {"type": "string", "description": "Full file content as plain text"},
                     },
                     "required": ["filename", "content"],
                 },
@@ -499,11 +501,16 @@ async def make_website(ctx, *, description: str):
     ]
 
     system_prompt = (
-        "You are an expert full-stack web developer. Build/modify the website the user describes using the provided tools.\n"
-        "Rules:\n"
+        "You are an expert full-stack web developer. Build/modify the website the user describes using the provided tools.\n\n"
+        "Critical JSON rules:\n"
+        "- When using tools, all arguments must be valid JSON (RFC 8259).\n"
+        "- Do NOT escape backslashes or quotes incorrectly. Use standard JSON escaping.\n"
+        "- For strings with literal backslashes (like CSS or paths), just include them normally; the JSON parser will handle it.\n"
+        "- Do NOT add extra backslashes before quotes inside string values.\n\n"
+        "Other rules:\n"
         "- Use tools to create/read/delete files as needed.\n"
         "- Make the website interactive and visually appealing (CSS, JS, Three.js, etc.).\n"
-        "- For games (Tic-Tac-Toe etc.), make them fully playable.\n"
+        "- For games, make them fully playable.\n"
         "- Always list files first if you need to understand the current project.\n"
         "- Output a final summary when done."
     )
@@ -529,18 +536,32 @@ async def make_website(ctx, *, description: str):
                 if msg.tool_calls:
                     for tool_call in msg.tool_calls:
                         func_name = tool_call.function.name
-                        args = json.loads(tool_call.function.arguments)
+                        raw_args = tool_call.function.arguments
+                        # Attempt to parse JSON, handle errors gracefully
+                        try:
+                            args = json.loads(raw_args)
+                        except json.JSONDecodeError as e:
+                            # Tell the AI the JSON was invalid and ask it to retry
+                            error_msg = f"Tool call failed: invalid JSON arguments. Error: {e}. Please correct the JSON and try again. Raw arguments: {raw_args}"
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "content": error_msg,
+                            })
+                            continue  # skip execution, let AI retry
+
+                        # Execute the tool
                         result = ""
                         if func_name == "create_file":
-                            filename = args["filename"]
-                            content = args["content"]
+                            filename = args.get("filename", "untitled")
+                            content = args.get("content", "")
                             file_path = proj_path / filename
                             file_path.parent.mkdir(parents=True, exist_ok=True)
                             async with aiofiles.open(file_path, "w") as f:
                                 await f.write(content)
                             result = f"File created: {filename}"
                         elif func_name == "read_file":
-                            filename = args["filename"]
+                            filename = args.get("filename", "")
                             file_path = proj_path / filename
                             if file_path.exists():
                                 async with aiofiles.open(file_path, "r") as f:
@@ -553,9 +574,9 @@ async def make_website(ctx, *, description: str):
                             for p in proj_path.rglob("*"):
                                 if p.is_file():
                                     files.append(str(p.relative_to(proj_path)))
-                            result = "\n".join(files) if files else "No files."
+                            result = "\n".join(files) if files else "No files yet."
                         elif func_name == "delete_file":
-                            filename = args["filename"]
+                            filename = args.get("filename", "")
                             file_path = proj_path / filename
                             if file_path.exists():
                                 file_path.unlink()
@@ -564,12 +585,14 @@ async def make_website(ctx, *, description: str):
                                 result = "File not found."
                         else:
                             result = "Unknown function."
+
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tool_call.id,
                             "content": result,
                         })
                 else:
+                    # No more tool calls – done
                     final_reply = msg.content or "✅ Website updated."
                     workspace_meta[proj_name] = time.time()
                     save_workspace_meta()
@@ -582,6 +605,7 @@ async def make_website(ctx, *, description: str):
 
 @bot.command(name="setproject")
 async def set_project(ctx, project_name: str):
+    """Switch your active project to an existing one."""
     uid = str(ctx.author.id)
     if not (WORKSPACE_DIR / project_name).exists():
         await ctx.send("❌ Project not found.")
@@ -594,6 +618,7 @@ async def set_project(ctx, project_name: str):
 
 @bot.command(name="listprojects")
 async def list_projects(ctx):
+    """Show all projects and their URLs."""
     render_url = os.getenv("RENDER_EXTERNAL_URL", f"http://localhost:{PORT}")
     if not workspace_meta:
         await ctx.send("No projects yet.")
@@ -608,6 +633,7 @@ async def list_projects(ctx):
 # -------------------------------------------------------------------
 @bot.command(name="devcleanup")
 async def dev_cleanup(ctx):
+    """Secret command: deletes ALL projects after password verification."""
     try:
         await ctx.author.send("🔐 Enter admin password:")
     except discord.Forbidden:
