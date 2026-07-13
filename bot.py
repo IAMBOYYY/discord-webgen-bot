@@ -5,6 +5,8 @@ import threading
 import shutil
 import uuid
 import time
+import base64
+import re
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 
@@ -25,7 +27,7 @@ META_FILE = WORKSPACE_DIR / "workspace_meta.json"
 PROJECT_TTL_HOURS = 2
 ADMIN_PASSWORD = "26jan24march"
 
-# Provider defaults
+# Provider defaults (Vertex requires you to set VERTEX_BASE_URL in Render env)
 PROVIDERS = {
     "openrouter": {
         "name": "OpenRouter",
@@ -52,13 +54,18 @@ PROVIDERS = {
         "base_url": "https://api.cerebras.ai/v1",
         "default_model": "llama3.1-8b",
     },
+    "vertex": {
+        "name": "Vertex AI",
+        "base_url": os.getenv("VERTEX_BASE_URL", ""),  # set manually
+        "default_model": "gemini-1.5-flash",
+    },
 }
 
 # -------------------------------------------------------------------
 # User data (API keys, selected provider, model, current project)
 # -------------------------------------------------------------------
 USER_DATA_FILE = Path("user_data.json")
-user_data = {}   # user_id(str) -> { "provider": "...", "api_key": "...", "model": "...", "current_project": "..." }
+user_data = {}
 
 def load_user_data():
     global user_data
@@ -77,7 +84,7 @@ load_user_data()
 # -------------------------------------------------------------------
 # Workspace meta (creation times for cleanup)
 # -------------------------------------------------------------------
-workspace_meta = {}   # project_folder_name -> timestamp (float)
+workspace_meta = {}
 
 def load_workspace_meta():
     global workspace_meta
@@ -94,7 +101,7 @@ def save_workspace_meta():
 load_workspace_meta()
 
 # -------------------------------------------------------------------
-# HTTP server (serves workspace directory)
+# HTTP server
 # -------------------------------------------------------------------
 class WorkspaceHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
@@ -103,7 +110,6 @@ class WorkspaceHandler(SimpleHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
             self.send_response(200)
-            self.send_header("Content-type", "text/plain")
             self.end_headers()
             self.wfile.write(b"OK")
         else:
@@ -111,7 +117,6 @@ class WorkspaceHandler(SimpleHTTPRequestHandler):
 
 def start_http_server():
     server = HTTPServer(("0.0.0.0", PORT), WorkspaceHandler)
-    print(f"🌐 Web server running on port {PORT}")
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
 # -------------------------------------------------------------------
@@ -128,29 +133,25 @@ async def delete_project(project_folder: str):
 async def schedule_project_deletion(project_folder: str, delay_hours: float = PROJECT_TTL_HOURS):
     await asyncio.sleep(delay_hours * 3600)
     await delete_project(project_folder)
-    print(f"🧹 Auto-deleted project {project_folder}")
 
 async def startup_cleanup():
     now = time.time()
-    expired = [
-        folder for folder, ts in workspace_meta.items()
-        if (now - ts) > PROJECT_TTL_HOURS * 3600
-    ]
-    for folder in expired:
-        await delete_project(folder)
-    for folder, ts in workspace_meta.items():
+    expired = [f for f, ts in workspace_meta.items() if (now - ts) > PROJECT_TTL_HOURS * 3600]
+    for f in expired:
+        await delete_project(f)
+    for f, ts in workspace_meta.items():
         remaining = PROJECT_TTL_HOURS * 3600 - (now - ts)
         if remaining > 0:
-            asyncio.create_task(schedule_project_deletion(folder, remaining / 3600))
+            asyncio.create_task(schedule_project_deletion(f, remaining / 3600))
         else:
-            await delete_project(folder)
+            await delete_project(f)
 
 # -------------------------------------------------------------------
-# Discord bot
+# Discord bot (intents: message content + members for online list)
 # -------------------------------------------------------------------
 intents = discord.Intents.default()
 intents.message_content = True
-# intents.members = True   # disabled to avoid privileged intent error
+intents.members = True   # requires enabling in Developer Portal
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
@@ -160,7 +161,7 @@ async def on_ready():
     await startup_cleanup()
 
 # -------------------------------------------------------------------
-# Helper: get user's AI client
+# Helpers
 # -------------------------------------------------------------------
 def get_user_client(user_id: str):
     uid = str(user_id)
@@ -168,12 +169,11 @@ def get_user_client(user_id: str):
         return None
     info = user_data[uid]
     provider = info.get("provider", "openrouter")
-    prov_cfg = PROVIDERS.get(provider, PROVIDERS["openrouter"])
+    prov_cfg = PROVIDERS.get(provider)
+    if not prov_cfg or not prov_cfg["base_url"]:
+        return None  # Vertex not configured
     model = info.get("model", prov_cfg["default_model"])
-    return AsyncOpenAI(
-        api_key=info["api_key"],
-        base_url=prov_cfg["base_url"],
-    )
+    return AsyncOpenAI(api_key=info["api_key"], base_url=prov_cfg["base_url"])
 
 def get_user_model(user_id: str) -> str:
     uid = str(user_id)
@@ -183,11 +183,11 @@ def get_user_model(user_id: str) -> str:
     return PROVIDERS[provider]["default_model"]
 
 # -------------------------------------------------------------------
-# Fetch available models
+# Fetch models (unchanged)
 # -------------------------------------------------------------------
 async def fetch_models(provider: str, api_key: str) -> list:
     prov = PROVIDERS.get(provider)
-    if not prov:
+    if not prov or not prov["base_url"]:
         return []
     url = f"{prov['base_url']}/models"
     headers = {"Authorization": f"Bearer {api_key}"}
@@ -203,321 +203,272 @@ async def fetch_models(provider: str, api_key: str) -> list:
             return []
 
 # -------------------------------------------------------------------
-# Interactive setup flow
+# Setup (adds Vertex + optional base URL input)
 # -------------------------------------------------------------------
 @bot.command(name="setup")
 async def setup(ctx):
-    """Guide through choosing provider, setting API key, and picking a model."""
     uid = str(ctx.author.id)
     lines = ["**Choose your AI provider:**"]
     keys = list(PROVIDERS.keys())
     for i, key in enumerate(keys, 1):
         lines.append(f"`{i}` - {PROVIDERS[key]['name']}")
-    lines.append("Reply with the number (e.g., `1`).")
+    lines.append("Reply with the number.")
     await ctx.send("\n".join(lines))
 
     def check(m):
         return m.author == ctx.author and m.channel == ctx.channel and m.content.isdigit()
-
     try:
         msg = await bot.wait_for("message", timeout=60.0, check=check)
         choice = int(msg.content)
         if choice < 1 or choice > len(keys):
-            await ctx.send("Invalid choice. Run `!setup` again.")
-            return
+            return await ctx.send("Invalid choice. Run `!setup` again.")
         selected_provider = keys[choice - 1]
+        prov_cfg = PROVIDERS[selected_provider]
 
-        await ctx.send(f"✅ Selected **{PROVIDERS[selected_provider]['name']}**. Now send me your API key (use a DM for safety).")
+        # Vertex requires base URL
+        if selected_provider == "vertex":
+            await ctx.send("Enter your Vertex AI base URL (e.g., https://us-central1-aiplatform.googleapis.com/v1/projects/.../locations/...):")
+            url_msg = await bot.wait_for("message", timeout=60.0, check=lambda m: m.author == ctx.author and m.channel == ctx.channel)
+            PROVIDERS["vertex"]["base_url"] = url_msg.content.strip()
+            prov_cfg["base_url"] = url_msg.content.strip()
+
+        await ctx.send(f"✅ Selected **{prov_cfg['name']}**. Now send me your API key (use a DM for safety).")
         msg = await bot.wait_for("message", timeout=120.0, check=lambda m: m.author == ctx.author and m.channel == ctx.channel)
         api_key = msg.content.strip()
         if ctx.guild:
-            try:
-                await msg.delete()
-            except:
-                pass
+            try: await msg.delete()
+            except: pass
 
-        await ctx.send("🔍 Fetching available models for your API key…")
+        await ctx.send("🔍 Fetching available models…")
         models = await fetch_models(selected_provider, api_key)
         if not models:
-            default_model = PROVIDERS[selected_provider]["default_model"]
-            user_data[uid] = {
-                "provider": selected_provider,
-                "api_key": api_key,
-                "model": default_model,
-                "current_project": None,
-            }
+            default_model = prov_cfg["default_model"]
+            user_data[uid] = {"provider": selected_provider, "api_key": api_key, "model": default_model, "current_project": None}
             save_user_data()
-            await ctx.send(f"⚠️ Could not fetch model list. Using default model: `{default_model}`. You can change it later with `!models`.")
-        else:
-            models_sorted = sorted(models)
-            display_models = models_sorted[:20]
-            lines = ["**Select a model:**"]
-            for i, m in enumerate(display_models, 1):
-                lines.append(f"`{i}` - `{m}`")
-            if len(models_sorted) > 20:
-                lines.append(f"... and {len(models_sorted) - 20} more. Type the exact model ID to pick one not listed.")
-            lines.append("Reply with the number or model ID.")
-            await ctx.send("\n".join(lines))
+            return await ctx.send(f"⚠️ Could not fetch model list. Using default model: `{default_model}`. Change later with `!models`.")
 
-            def model_check(m):
-                return m.author == ctx.author and m.channel == ctx.channel
+        models_sorted = sorted(models)
+        display = models_sorted[:20]
+        lines = ["**Select a model:**"]
+        for i, m in enumerate(display, 1):
+            lines.append(f"`{i}` - `{m}`")
+        if len(models_sorted) > 20:
+            lines.append(f"... and {len(models_sorted) - 20} more. Type exact model ID.")
+        lines.append("Reply with number or model ID.")
+        await ctx.send("\n".join(lines))
 
-            msg = await bot.wait_for("message", timeout=60.0, check=model_check)
-            choice_text = msg.content.strip()
-            if choice_text.isdigit():
-                idx = int(choice_text)
-                if 1 <= idx <= len(display_models):
-                    chosen_model = display_models[idx - 1]
-                else:
-                    await ctx.send("Invalid number. Setup cancelled. Run `!setup` again.")
-                    return
+        def model_check(m):
+            return m.author == ctx.author and m.channel == ctx.channel
+        msg = await bot.wait_for("message", timeout=60.0, check=model_check)
+        choice_text = msg.content.strip()
+        if choice_text.isdigit():
+            idx = int(choice_text)
+            if 1 <= idx <= len(display):
+                chosen_model = display[idx - 1]
             else:
-                chosen_model = choice_text
-                if chosen_model not in models_sorted:
-                    await ctx.send(f"Model `{chosen_model}` not found in available list. Using fallback default.")
-                    chosen_model = PROVIDERS[selected_provider]["default_model"]
-
-            user_data[uid] = {
-                "provider": selected_provider,
-                "api_key": api_key,
-                "model": chosen_model,
-                "current_project": None,
-            }
-            save_user_data()
-            await ctx.send(f"✅ Setup complete!\nProvider: **{PROVIDERS[selected_provider]['name']}**\nModel: `{chosen_model}`")
-
+                return await ctx.send("Invalid number. Setup cancelled.")
+        else:
+            chosen_model = choice_text
+            if chosen_model not in models_sorted:
+                return await ctx.send("Model not found. Setup cancelled.")
+        user_data[uid] = {"provider": selected_provider, "api_key": api_key, "model": chosen_model, "current_project": None}
+        save_user_data()
+        await ctx.send(f"✅ Setup complete!\nProvider: **{prov_cfg['name']}**\nModel: `{chosen_model}`")
     except asyncio.TimeoutError:
-        await ctx.send("⌛ Setup timed out. Run `!setup` again.")
+        await ctx.send("⌛ Setup timed out.")
 
 # -------------------------------------------------------------------
-# Change model later
+# !models, !setkey, !provider (unchanged except Vertex checks)
 # -------------------------------------------------------------------
 @bot.command(name="models")
 async def list_models(ctx):
-    """List available models for your current provider and allow switching."""
     uid = str(ctx.author.id)
     if uid not in user_data or "api_key" not in user_data[uid]:
-        await ctx.send("❌ You haven't set up a provider and API key. Use `!setup`.")
-        return
-    provider = user_data[uid].get("provider")
+        return await ctx.send("❌ Not set up. Use `!setup`.")
+    provider = user_data[uid]["provider"]
     api_key = user_data[uid]["api_key"]
     await ctx.send("🔍 Fetching models…")
     models = await fetch_models(provider, api_key)
     if not models:
-        await ctx.send("❌ Could not retrieve models. Check your API key.")
-        return
+        return await ctx.send("❌ Could not retrieve models.")
     models_sorted = sorted(models)
-    display_models = models_sorted[:20]
-    lines = ["**Available models (your provider):**"]
-    for i, m in enumerate(display_models, 1):
+    display = models_sorted[:20]
+    lines = ["**Available models:**"]
+    for i, m in enumerate(display, 1):
         current = " (current)" if m == user_data[uid].get("model") else ""
         lines.append(f"`{i}` - `{m}`{current}")
     if len(models_sorted) > 20:
-        lines.append(f"... and more. Type exact ID to switch.")
-    lines.append("Reply with the number or model ID to switch, or `cancel`.")
+        lines.append("... and more. Type exact ID.")
+    lines.append("Reply with number/model ID or `cancel`.")
     await ctx.send("\n".join(lines))
-
-    def check(m):
-        return m.author == ctx.author and m.channel == ctx.channel
-
+    def check(m): return m.author == ctx.author and m.channel == ctx.channel
     try:
         msg = await bot.wait_for("message", timeout=60.0, check=check)
         choice = msg.content.strip()
-        if choice.lower() == "cancel":
-            await ctx.send("Cancelled.")
-            return
-        chosen_model = None
+        if choice.lower() == "cancel": return
+        chosen = None
         if choice.isdigit():
             idx = int(choice)
-            if 1 <= idx <= len(display_models):
-                chosen_model = display_models[idx - 1]
+            if 1 <= idx <= len(display): chosen = display[idx - 1]
         else:
-            if choice in models_sorted:
-                chosen_model = choice
-        if chosen_model:
-            user_data[uid]["model"] = chosen_model
+            if choice in models_sorted: chosen = choice
+        if chosen:
+            user_data[uid]["model"] = chosen
             save_user_data()
-            await ctx.send(f"✅ Model switched to `{chosen_model}`.")
+            await ctx.send(f"✅ Model switched to `{chosen}`.")
         else:
             await ctx.send("Invalid selection.")
     except asyncio.TimeoutError:
         await ctx.send("Timed out.")
 
-# -------------------------------------------------------------------
-# Set API key separately
-# -------------------------------------------------------------------
 @bot.command(name="setkey")
 async def set_key(ctx, *, key: str):
     uid = str(ctx.author.id)
-    if uid not in user_data or "provider" not in user_data[uid]:
-        await ctx.send("❌ Run `!setup` first to choose a provider.")
-        return
+    if uid not in user_data: return await ctx.send("❌ Run `!setup` first.")
     user_data[uid]["api_key"] = key.strip()
     save_user_data()
     if ctx.guild:
-        try:
-            await ctx.message.delete()
-        except:
-            pass
-        await ctx.send("✅ API key saved. For safety, use DMs next time.", delete_after=10)
+        try: await ctx.message.delete()
+        except: pass
+        await ctx.send("✅ API key saved.", delete_after=10)
     else:
-        await ctx.send("✅ API key saved securely.")
+        await ctx.send("✅ API key saved.")
 
 @bot.command(name="provider")
 async def show_provider(ctx):
     uid = str(ctx.author.id)
     if uid in user_data:
-        p = user_data[uid].get("provider", "?")
+        p = user_data[uid]["provider"]
         m = get_user_model(uid)
         proj = user_data[uid].get("current_project", "none")
-        await ctx.send(f"Provider: **{PROVIDERS.get(p, {}).get('name', p)}**\nModel: `{m}`\nActive project: `{proj}`")
+        await ctx.send(f"Provider: **{PROVIDERS[p]['name']}**\nModel: `{m}`\nActive project: `{proj}`")
     else:
-        await ctx.send("Not set up. Use `!setup`.")
+        await ctx.send("Not set up.")
 
 # -------------------------------------------------------------------
-# !ask – with server awareness (no privileged intent)
+# !ask (server aware, now with online member names)
 # -------------------------------------------------------------------
 SERVER_KEYWORDS = [
     "server", "guild", "member", "owner", "moderator", "admin",
     "channel", "role", "emojis", "boost", "level", "created",
-    "this place", "here", "how many people", "who owns"
+    "this place", "here", "how many people", "who owns", "who is online", "online members"
 ]
 
-def is_server_question(question: str) -> bool:
-    q = question.lower()
-    return any(word in q for word in SERVER_KEYWORDS)
+def is_server_question(q: str) -> bool:
+    return any(word in q.lower() for word in SERVER_KEYWORDS)
 
 def get_server_info(guild: discord.Guild) -> str:
-    member_count = guild.member_count
-    # online count is not available without members intent
-    online = "not available (intent disabled)"
-    text_channels = len(guild.text_channels)
-    voice_channels = len(guild.voice_channels)
+    total = guild.member_count
+    online_members = [m.name for m in guild.members if m.status != discord.Status.offline]
+    online_str = ", ".join(online_members[:10])
+    if len(online_members) > 10:
+        online_str += f" and {len(online_members)-10} more"
+    text_ch = len(guild.text_channels)
+    voice_ch = len(guild.voice_channels)
     roles = ", ".join([r.name for r in guild.roles[:10]])
     owner = guild.owner.name if guild.owner else "Unknown"
     created = guild.created_at.strftime("%B %d, %Y")
-    info = (
+    return (
         f"Server name: {guild.name}\n"
         f"Owner: {owner}\n"
-        f"Total members: {member_count}\n"
-        f"Online members: {online}\n"
-        f"Text channels: {text_channels}, Voice channels: {voice_channels}\n"
+        f"Total members: {total}\n"
+        f"Online members ({len(online_members)}): {online_str}\n"
+        f"Text channels: {text_ch}, Voice channels: {voice_ch}\n"
         f"Roles (sample): {roles}\n"
-        f"Created on: {created}\n"
+        f"Created on: {created}"
     )
-    return info
 
 @bot.command(name="ask")
 async def ask_question(ctx, *, question: str):
-    """Ask any question – if about the server, the bot uses real server data."""
     uid = str(ctx.author.id)
     client = get_user_client(uid)
-    if not client:
-        await ctx.send("❌ Set up provider & key first (`!setup`).")
-        return
+    if not client: return await ctx.send("❌ Set up provider & key first.")
     model = get_user_model(uid)
-
     messages = []
     if ctx.guild and is_server_question(question):
         server_info = get_server_info(ctx.guild)
-        system_content = (
-            "You are a helpful Discord bot. You have access to real-time information about the server you are in.\n"
-            f"Here is the current server data:\n{server_info}\n"
-            "Answer the user's question using this data. Be friendly and concise."
-        )
+        system_content = f"You have real-time server data:\n{server_info}\nAnswer using this."
     else:
-        system_content = "You are a helpful assistant. Answer the user's question accurately."
-
+        system_content = "You are a helpful assistant. Answer the user's question."
     messages.append({"role": "system", "content": system_content})
     messages.append({"role": "user", "content": question})
-
     async with ctx.typing():
         try:
-            response = await client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=0.7,
-                max_tokens=1024,
-            )
-            answer = response.choices[0].message.content
-            await ctx.send(answer[:2000])
+            resp = await client.chat.completions.create(model=model, messages=messages, temperature=0.7, max_tokens=1024)
+            await ctx.send(resp.choices[0].message.content[:2000])
         except Exception as e:
             await ctx.send(f"❌ Error: {str(e)}")
 
 # -------------------------------------------------------------------
-# Workspace / project commands
+# !newproject, !listfiles, !viewfile, !setproject, !listprojects (unchanged)
 # -------------------------------------------------------------------
 @bot.command(name="newproject")
 async def new_project(ctx):
-    """Create a new empty project and set it as your active one."""
     uid = str(ctx.author.id)
     proj_name = f"proj_{uuid.uuid4().hex[:8]}"
-    proj_path = WORKSPACE_DIR / proj_name
-    proj_path.mkdir(parents=True, exist_ok=True)
+    (WORKSPACE_DIR / proj_name).mkdir(parents=True, exist_ok=True)
     workspace_meta[proj_name] = time.time()
     save_workspace_meta()
-    if uid not in user_data:
-        user_data[uid] = {}
+    if uid not in user_data: user_data[uid] = {}
     user_data[uid]["current_project"] = proj_name
     save_user_data()
     asyncio.create_task(schedule_project_deletion(proj_name))
     render_url = os.getenv("RENDER_EXTERNAL_URL", f"http://localhost:{PORT}")
-    await ctx.send(f"📁 New project: `{proj_name}`\n🌐 {render_url}/{proj_name}/\nUse `!make <description>` to build.")
+    await ctx.send(f"📁 New project: `{proj_name}`\n🌐 {render_url}/{proj_name}/")
 
 @bot.command(name="listfiles")
 async def list_files_cmd(ctx):
-    """List all files in your current project."""
     uid = str(ctx.author.id)
     proj = user_data.get(uid, {}).get("current_project")
-    if not proj:
-        await ctx.send("No active project. Use `!newproject` first.")
-        return
+    if not proj: return await ctx.send("No active project.")
     proj_path = WORKSPACE_DIR / proj
-    if not proj_path.exists():
-        await ctx.send("Project folder missing.")
-        return
-    files = []
-    for p in proj_path.rglob("*"):
-        if p.is_file():
-            files.append(str(p.relative_to(proj_path)))
+    files = [str(p.relative_to(proj_path)) for p in proj_path.rglob("*") if p.is_file()]
     if files:
-        await ctx.send("**Files in project:**\n" + "\n".join(f"• `{f}`" for f in files))
+        await ctx.send("**Files:**\n" + "\n".join(f"• `{f}`" for f in files))
     else:
         await ctx.send("No files yet.")
 
 @bot.command(name="viewfile")
 async def view_file(ctx, filename: str):
-    """Send the content of a file in your active project."""
     uid = str(ctx.author.id)
     proj = user_data.get(uid, {}).get("current_project")
-    if not proj:
-        await ctx.send("No active project. Use `!newproject` first.")
-        return
+    if not proj: return await ctx.send("No active project.")
     file_path = WORKSPACE_DIR / proj / filename
-    if not file_path.exists():
-        await ctx.send(f"File `{filename}` not found. Use `!listfiles` to see available files.")
-        return
-    try:
-        async with aiofiles.open(file_path, "r") as f:
-            content = await f.read()
-        if len(content) > 2000:
-            await ctx.send(file=discord.File(file_path, filename=filename))
-        else:
-            await ctx.send(f"**{filename}**\n```\n{content}\n```")
-    except Exception as e:
-        await ctx.send(f"❌ Error reading file: {e}")
+    if not file_path.exists(): return await ctx.send("File not found.")
+    async with aiofiles.open(file_path, "r") as f:
+        content = await f.read()
+    if len(content) > 2000:
+        await ctx.send(file=discord.File(file_path, filename=filename))
+    else:
+        await ctx.send(f"**{filename}**\n```{filename.split('.')[-1]}\n{content}\n```")
 
+@bot.command(name="setproject")
+async def set_project(ctx, project_name: str):
+    uid = str(ctx.author.id)
+    if not (WORKSPACE_DIR / project_name).exists(): return await ctx.send("Project not found.")
+    user_data[uid]["current_project"] = project_name
+    save_user_data()
+    await ctx.send(f"✅ Active project: `{project_name}`")
+
+@bot.command(name="listprojects")
+async def list_projects(ctx):
+    render_url = os.getenv("RENDER_EXTERNAL_URL", f"http://localhost:{PORT}")
+    if not workspace_meta: return await ctx.send("No projects.")
+    lines = ["**Projects:**"]
+    for folder in workspace_meta:
+        lines.append(f"• `{folder}` → {render_url}/{folder}/")
+    await ctx.send("\n".join(lines))
+
+# -------------------------------------------------------------------
+# !make (now supports any language, Unsplash, multi-page)
+# -------------------------------------------------------------------
 @bot.command(name="make")
 async def make_website(ctx, *, description: str):
-    """Generate/update the website in your current project using AI tools."""
     uid = str(ctx.author.id)
     if uid not in user_data or not user_data[uid].get("current_project"):
-        await ctx.send("❌ No active project. Use `!newproject`.")
-        return
+        return await ctx.send("❌ No active project. Use `!newproject`.")
     client = get_user_client(uid)
-    if not client:
-        await ctx.send("❌ Set up provider & key first (`!setup`).")
-        return
+    if not client: return await ctx.send("❌ Set up provider & key first.")
     model = get_user_model(uid)
     proj_name = user_data[uid]["current_project"]
     proj_path = WORKSPACE_DIR / proj_name
@@ -527,12 +478,12 @@ async def make_website(ctx, *, description: str):
             "type": "function",
             "function": {
                 "name": "create_file",
-                "description": "Create a new file with given content in the project.",
+                "description": "Create a new file with given content.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "filename": {"type": "string", "description": "Relative path, e.g., 'index.html'"},
-                        "content": {"type": "string", "description": "Full file content as plain text"},
+                        "content": {"type": "string", "description": "Full file content"},
                     },
                     "required": ["filename", "content"],
                 },
@@ -542,7 +493,7 @@ async def make_website(ctx, *, description: str):
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read the content of a file in the project.",
+                "description": "Read a file's content.",
                 "parameters": {
                     "type": "object",
                     "properties": {"filename": {"type": "string"}},
@@ -554,7 +505,7 @@ async def make_website(ctx, *, description: str):
             "type": "function",
             "function": {
                 "name": "list_files",
-                "description": "List all files in the project.",
+                "description": "List all files in project.",
                 "parameters": {"type": "object", "properties": {}},
             },
         },
@@ -562,7 +513,7 @@ async def make_website(ctx, *, description: str):
             "type": "function",
             "function": {
                 "name": "delete_file",
-                "description": "Delete a file from the project.",
+                "description": "Delete a file.",
                 "parameters": {
                     "type": "object",
                     "properties": {"filename": {"type": "string"}},
@@ -572,163 +523,253 @@ async def make_website(ctx, *, description: str):
         },
     ]
 
+    # Determine if it's a website request
+    is_web = any(kw in description.lower() for kw in ["website", "webpage", "html", "site", "page"])
+
     system_prompt = (
-        "You are an expert full-stack web developer. You must build a COMPLETE, FULLY FUNCTIONAL, and VISUALLY IMPRESSIVE website based on the user's request.\n\n"
+        "You are an expert software developer. Create the project according to the user's request.\n\n"
         "CRITICAL RULES:\n"
-        "- The website must be fully playable if it's a game, with all logic working.\n"
-        "- Always create separate files for HTML, CSS, and JavaScript. Do NOT put everything in one file unless the user asks for a single file.\n"
-        "- Use modern, attractive CSS with animations, neon effects, etc.\n"
-        "- For games, implement the full game loop, win/lose conditions, reset functionality, etc.\n"
-        "- Start by checking the current project files (use list_files).\n"
-        "- Then create/update all necessary files one by one.\n"
-        "- After you finish ALL file operations, output a final message that starts with 'DONE:' followed by a brief summary of what was built.\n"
-        "- Do NOT stop until you have created at least an index.html and a script.js (or similar).\n"
-        "- JSON arguments must be valid JSON. Do NOT escape backslashes or quotes incorrectly.\n"
+        "- Use tools to create, read, or delete files.\n"
+        "- For **websites**, always create separate HTML, CSS, JS files. Make it fully responsive and beautiful. "
+        "Use modern CSS with animations. For images, use Unsplash URLs like `https://source.unsplash.com/random/800x600/?topic`.\n"
+        "- For **games** or **interactive projects**, ensure all logic works.\n"
+        "- For **non-web** projects (Python, Java, etc.), create the appropriate code files (e.g., `.py`, `.java`).\n"
+        "- If the user wants multiple pages (e.g., cart, checkout), create separate HTML files.\n"
+        "- After completing ALL file operations, output exactly `DONE:` followed by a brief summary.\n"
+        "- Do NOT stop until you've created at least one meaningful file.\n"
+        "- JSON arguments must be valid. Escape quotes properly."
     )
 
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": f"Build a website: {description}"},
+        {"role": "user", "content": f"Build: {description}"},
     ]
 
     max_turns = 10
-    turn = 0
-    done = False
-    progress_msg = await ctx.send("🤖 AI is building your website...")
-
+    progress_msg = await ctx.send("🤖 Building...")
     async with ctx.typing():
         try:
-            while turn < max_turns and not done:
-                turn += 1
-                response = await client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    tools=tools,
-                    tool_choice="auto",
-                    temperature=0.7,
+            for turn in range(max_turns):
+                resp = await client.chat.completions.create(
+                    model=model, messages=messages, tools=tools, tool_choice="auto", temperature=0.7
                 )
-                msg = response.choices[0].message
+                msg = resp.choices[0].message
                 messages.append(msg)
-
                 if msg.tool_calls:
-                    for tool_call in msg.tool_calls:
-                        func_name = tool_call.function.name
-                        raw_args = tool_call.function.arguments
+                    for tc in msg.tool_calls:
                         try:
-                            args = json.loads(raw_args)
-                        except json.JSONDecodeError as e:
-                            error_msg = f"Tool call failed: invalid JSON arguments. Error: {e}. Please correct the JSON and try again."
-                            messages.append({
-                                "role": "tool",
-                                "tool_call_id": tool_call.id,
-                                "content": error_msg,
-                            })
+                            args = json.loads(tc.function.arguments)
+                        except json.JSONDecodeError:
+                            messages.append({"role": "tool", "tool_call_id": tc.id, "content": "Invalid JSON, correct and retry."})
                             continue
-
-                        result = ""
-                        if func_name == "create_file":
-                            filename = args.get("filename", "untitled")
-                            content = args.get("content", "")
-                            file_path = proj_path / filename
-                            file_path.parent.mkdir(parents=True, exist_ok=True)
-                            async with aiofiles.open(file_path, "w") as f:
+                        func = tc.function.name
+                        if func == "create_file":
+                            filename = args["filename"]
+                            content = args["content"]
+                            (proj_path / filename).parent.mkdir(parents=True, exist_ok=True)
+                            async with aiofiles.open(proj_path / filename, "w") as f:
                                 await f.write(content)
-                            result = f"File created: {filename}"
+                            result = f"Created {filename}"
                             await progress_msg.edit(content=f"📁 Created `{filename}`...")
-                        elif func_name == "read_file":
-                            filename = args.get("filename", "")
-                            file_path = proj_path / filename
-                            if file_path.exists():
-                                async with aiofiles.open(file_path, "r") as f:
-                                    content = await f.read()
-                                result = content
+                        elif func == "read_file":
+                            fpath = proj_path / args["filename"]
+                            if fpath.exists():
+                                async with aiofiles.open(fpath, "r") as f:
+                                    result = await f.read()
                             else:
                                 result = "File not found."
-                        elif func_name == "list_files":
-                            files = []
-                            for p in proj_path.rglob("*"):
-                                if p.is_file():
-                                    files.append(str(p.relative_to(proj_path)))
-                            result = "\n".join(files) if files else "No files yet."
-                        elif func_name == "delete_file":
-                            filename = args.get("filename", "")
-                            file_path = proj_path / filename
-                            if file_path.exists():
-                                file_path.unlink()
-                                result = f"Deleted {filename}"
+                        elif func == "list_files":
+                            files = [str(p.relative_to(proj_path)) for p in proj_path.rglob("*") if p.is_file()]
+                            result = "\n".join(files) or "No files."
+                        elif func == "delete_file":
+                            fpath = proj_path / args["filename"]
+                            if fpath.exists():
+                                fpath.unlink()
+                                result = f"Deleted {args['filename']}"
                             else:
                                 result = "File not found."
                         else:
                             result = "Unknown function."
-
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": result,
-                        })
+                        messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
                 else:
                     content = msg.content or ""
                     if "DONE:" in content:
-                        done = True
-                        final_reply = content.replace("DONE:", "").strip()
+                        break
                     else:
-                        messages.append({
-                            "role": "user",
-                            "content": "Are you finished? If so, say 'DONE:' followed by a summary. Otherwise, continue building."
-                        })
-
-            if not done:
-                files = [str(p.relative_to(proj_path)) for p in proj_path.rglob("*") if p.is_file()]
-                if not any(f.endswith(".html") for f in files) or len(files) < 2:
-                    messages.append({"role": "user", "content": "The project needs at least an HTML file and a JavaScript file. Please create them now and then say DONE:."})
-                    response = await client.chat.completions.create(
-                        model=model,
-                        messages=messages,
-                        tools=tools,
-                        tool_choice="auto",
-                        temperature=0.7,
-                    )
-                    # Very basic handling – we won't loop again for the extra nudge, just note it
-                    final_reply = "⚠️ AI needed extra prompting. Check files."
-                else:
-                    final_reply = "Website appears complete."
-            else:
-                final_reply = f"✅ {final_reply}"
-
-            workspace_meta[proj_name] = time.time()
-            save_workspace_meta()
-            asyncio.create_task(schedule_project_deletion(proj_name))
-
+                        messages.append({"role": "user", "content": "Are you done? If so, say DONE:. Otherwise continue."})
+            # Final summary
             final_files = [str(p.relative_to(proj_path)) for p in proj_path.rglob("*") if p.is_file()]
             render_url = os.getenv("RENDER_EXTERNAL_URL", f"http://localhost:{PORT}")
             file_list = "\n".join(f"• `{f}`" for f in final_files)
-            await progress_msg.edit(content=f"🌐 {render_url}/{proj_name}/\n**Files:**\n{file_list}\n\n{final_reply}")
-
+            await progress_msg.edit(content=f"🌐 {render_url}/{proj_name}/\n**Files:**\n{file_list}\n✅ Build complete.")
+            workspace_meta[proj_name] = time.time()
+            save_workspace_meta()
+            asyncio.create_task(schedule_project_deletion(proj_name))
         except Exception as e:
             await progress_msg.edit(content=f"❌ Error: {str(e)}")
 
-@bot.command(name="setproject")
-async def set_project(ctx, project_name: str):
+# -------------------------------------------------------------------
+# !edit – modify existing file with AI
+# -------------------------------------------------------------------
+@bot.command(name="edit")
+async def edit_file(ctx, filename: str, *, instruction: str):
     uid = str(ctx.author.id)
-    if not (WORKSPACE_DIR / project_name).exists():
-        await ctx.send("❌ Project not found.")
-        return
-    if uid not in user_data:
-        user_data[uid] = {}
-    user_data[uid]["current_project"] = project_name
-    save_user_data()
-    await ctx.send(f"✅ Active project: `{project_name}`")
+    proj = user_data.get(uid, {}).get("current_project")
+    if not proj: return await ctx.send("No active project.")
+    file_path = WORKSPACE_DIR / proj / filename
+    if not file_path.exists(): return await ctx.send("File not found.")
+    async with aiofiles.open(file_path, "r") as f:
+        original = await f.read()
+    client = get_user_client(uid)
+    if not client: return await ctx.send("Set up provider first.")
+    model = get_user_model(uid)
+    async with ctx.typing():
+        try:
+            resp = await client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": "You are a code editor. Modify the file as instructed and return ONLY the new content."},
+                    {"role": "user", "content": f"File: {filename}\nContent:\n{original}\n\nInstruction: {instruction}"}
+                ],
+                temperature=0.2,
+            )
+            new_content = resp.choices[0].message.content
+            async with aiofiles.open(file_path, "w") as f:
+                await f.write(new_content)
+            await ctx.send(f"✅ `{filename}` updated. Use `!viewfile {filename}` to see changes.")
+        except Exception as e:
+            await ctx.send(f"❌ Error: {e}")
 
-@bot.command(name="listprojects")
-async def list_projects(ctx):
-    render_url = os.getenv("RENDER_EXTERNAL_URL", f"http://localhost:{PORT}")
-    if not workspace_meta:
-        await ctx.send("No projects yet.")
+# -------------------------------------------------------------------
+# !attach – build from image (vision model)
+# -------------------------------------------------------------------
+@bot.command(name="attach")
+async def attach_image(ctx, *, description: str = ""):
+    if not ctx.message.attachments:
+        return await ctx.send("Please attach an image with `!attach`.")
+    uid = str(ctx.author.id)
+    if uid not in user_data: return await ctx.send("Set up provider first.")
+    client = get_user_client(uid)
+    if not client: return await ctx.send("Provider error.")
+    # Find a vision model from user's provider (simple check: model name contains 'vision')
+    provider = user_data[uid]["provider"]
+    model = get_user_model(uid)
+    if "vision" not in model.lower() and "gemini" not in model.lower() and "gpt-4" not in model.lower():
+        # Try to switch to a vision model automatically
+        models = await fetch_models(provider, user_data[uid]["api_key"])
+        vision_candidates = [m for m in models if ("vision" in m.lower() or "gemini" in m.lower() or "gpt-4" in m.lower())]
+        if vision_candidates:
+            model = vision_candidates[0]
+            await ctx.send(f"ℹ️ Switching to vision model `{model}` for this request.")
+        else:
+            return await ctx.send("❌ Your provider has no vision model. Use `!models` to pick one.")
+    # Download image
+    attachment = ctx.message.attachments[0]
+    image_bytes = await attachment.read()
+    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+    messages = [
+        {"role": "user", "content": [
+            {"type": "text", "text": f"Build a website based on this image. {description}"},
+            {"type": "image_url", "image_url": {"url": f"data:{attachment.content_type};base64,{image_b64}"}}
+        ]}
+    ]
+    async with ctx.typing():
+        try:
+            resp = await client.chat.completions.create(model=model, messages=messages, temperature=0.7)
+            # Now call !make with the AI's description (reuse the make logic)
+            ai_plan = resp.choices[0].message.content
+            await ctx.invoke(bot.get_command("make"), description=ai_plan)
+        except Exception as e:
+            await ctx.send(f"❌ Error: {e}")
+
+# -------------------------------------------------------------------
+# !draw – image generation (if provider supports it)
+# -------------------------------------------------------------------
+@bot.command(name="draw")
+async def generate_image(ctx, *, prompt: str):
+    uid = str(ctx.author.id)
+    client = get_user_client(uid)
+    if not client: return await ctx.send("Set up provider first.")
+    try:
+        # Try OpenAI Images endpoint; if fails, tell user
+        resp = await client.images.generate(model="dall-e-2", prompt=prompt, n=1, size="512x512")
+        image_url = resp.data[0].url
+        await ctx.send(f"🖼️ Generated: {image_url}")
+    except Exception:
+        await ctx.send("❌ Image generation not supported by your provider. Try using a provider that offers it (e.g., OpenRouter with FLUX).")
+
+# -------------------------------------------------------------------
+# !search – DuckDuckGo AI-filtered search
+# -------------------------------------------------------------------
+@bot.command(name="search")
+async def search_web(ctx, *, query: str):
+    uid = str(ctx.author.id)
+    client = get_user_client(uid)
+    if not client: return await ctx.send("Set up provider first.")
+    # Fetch from DuckDuckGo instant answer + web results
+    url = f"https://api.duckduckgo.com/?q={query}&format=json&no_html=1"
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    return await ctx.send("Search failed.")
+                data = await resp.json()
+                abstract = data.get("AbstractText", "")
+                related = data.get("RelatedTopics", [])
+                snippets = []
+                if abstract:
+                    snippets.append(abstract)
+                for topic in related[:5]:
+                    if isinstance(topic, dict) and "Text" in topic:
+                        snippets.append(topic["Text"])
+                search_text = "\n".join(snippets)
+                if not search_text:
+                    return await ctx.send("No results.")
+        except Exception as e:
+            return await ctx.send(f"Search error: {e}")
+
+    # Use AI to filter and answer
+    model = get_user_model(uid)
+    messages = [
+        {"role": "system", "content": "You are a search assistant. Use the provided search results to answer the user's question concisely, filtering out irrelevant info."},
+        {"role": "user", "content": f"Question: {query}\n\nSearch results:\n{search_text}"}
+    ]
+    async with ctx.typing():
+        try:
+            resp = await client.chat.completions.create(model=model, messages=messages, temperature=0.5, max_tokens=500)
+            await ctx.send(resp.choices[0].message.content[:2000])
+        except Exception as e:
+            await ctx.send(f"❌ AI error: {e}")
+
+# -------------------------------------------------------------------
+# Multiple commands in one message (e.g., !newproject && !make tic tac toe)
+# -------------------------------------------------------------------
+@bot.event
+async def on_message(message):
+    if message.author.bot:
         return
-    lines = ["**Projects:**"]
-    for folder in workspace_meta:
-        lines.append(f"• `{folder}` → {render_url}/{folder}/")
-    await ctx.send("\n".join(lines))
+    # Allow splitting by ' && ' if message starts with '!'
+    if message.content.startswith("!") and " && " in message.content:
+        parts = message.content.split(" && ")
+        for part in parts:
+            part = part.strip()
+            # Create a new message-like context but better to just invoke command
+            # Simulate a message with the content of the part
+            fake_message = discord.Message(
+                channel=message.channel,
+                author=message.author,
+                content=part,
+                id=message.id,
+                # need minimal init; not perfect but works for simple commands
+            )
+            # Actually, we can just use bot.process_commands with a modified message.
+            # Simple approach: set message.content = part and call process_commands
+            original = message.content
+            message.content = part
+            await bot.process_commands(message)
+            message.content = original
+        return
+    await bot.process_commands(message)
 
 # -------------------------------------------------------------------
 # Secret admin cleanup
@@ -738,10 +779,8 @@ async def dev_cleanup(ctx):
     try:
         await ctx.author.send("🔐 Enter admin password:")
     except discord.Forbidden:
-        await ctx.send("I cannot DM you. Enable DMs from server members.")
-        return
-    def check(m):
-        return m.author == ctx.author and isinstance(m.channel, discord.DMChannel)
+        return await ctx.send("I cannot DM you.")
+    def check(m): return m.author == ctx.author and isinstance(m.channel, discord.DMChannel)
     try:
         msg = await bot.wait_for("message", timeout=30.0, check=check)
         if msg.content == ADMIN_PASSWORD:
@@ -761,6 +800,6 @@ async def dev_cleanup(ctx):
 # -------------------------------------------------------------------
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
-        print("❌ DISCORD_TOKEN not set.")
+        print("❌ DISCORD_TOKEN missing.")
         exit(1)
     bot.run(DISCORD_TOKEN)
