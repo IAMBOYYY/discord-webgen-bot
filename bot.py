@@ -6,7 +6,6 @@ import shutil
 import uuid
 import time
 import base64
-import re
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 
@@ -27,7 +26,7 @@ META_FILE = WORKSPACE_DIR / "workspace_meta.json"
 PROJECT_TTL_HOURS = 2
 ADMIN_PASSWORD = "26jan24march"
 
-# Provider defaults (Vertex requires you to set VERTEX_BASE_URL in Render env)
+# Provider defaults
 PROVIDERS = {
     "openrouter": {
         "name": "OpenRouter",
@@ -56,16 +55,16 @@ PROVIDERS = {
     },
     "vertex": {
         "name": "Vertex AI",
-        "base_url": os.getenv("VERTEX_BASE_URL", ""),  # set manually
+        "base_url": os.getenv("VERTEX_BASE_URL", ""),  # optional, leave empty to ignore
         "default_model": "gemini-1.5-flash",
     },
 }
 
 # -------------------------------------------------------------------
-# User data (API keys, selected provider, model, current project)
+# User data
 # -------------------------------------------------------------------
 USER_DATA_FILE = Path("user_data.json")
-user_data = {}
+user_data = {}   # user_id(str) -> { "provider": "...", "api_key": "...", "model": "...", "current_project": "..." }
 
 def load_user_data():
     global user_data
@@ -82,7 +81,7 @@ def save_user_data():
 load_user_data()
 
 # -------------------------------------------------------------------
-# Workspace meta (creation times for cleanup)
+# Workspace meta
 # -------------------------------------------------------------------
 workspace_meta = {}
 
@@ -120,7 +119,7 @@ def start_http_server():
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
 # -------------------------------------------------------------------
-# Cleanup logic
+# Cleanup
 # -------------------------------------------------------------------
 async def delete_project(project_folder: str):
     path = WORKSPACE_DIR / project_folder
@@ -147,11 +146,11 @@ async def startup_cleanup():
             await delete_project(f)
 
 # -------------------------------------------------------------------
-# Discord bot (intents: message content + members for online list)
+# Discord bot
 # -------------------------------------------------------------------
 intents = discord.Intents.default()
 intents.message_content = True
-intents.members = True   # requires enabling in Developer Portal
+intents.members = True   # Enable in Developer Portal for online member list
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
@@ -171,7 +170,7 @@ def get_user_client(user_id: str):
     provider = info.get("provider", "openrouter")
     prov_cfg = PROVIDERS.get(provider)
     if not prov_cfg or not prov_cfg["base_url"]:
-        return None  # Vertex not configured
+        return None
     model = info.get("model", prov_cfg["default_model"])
     return AsyncOpenAI(api_key=info["api_key"], base_url=prov_cfg["base_url"])
 
@@ -183,7 +182,7 @@ def get_user_model(user_id: str) -> str:
     return PROVIDERS[provider]["default_model"]
 
 # -------------------------------------------------------------------
-# Fetch models (unchanged)
+# Fetch models
 # -------------------------------------------------------------------
 async def fetch_models(provider: str, api_key: str) -> list:
     prov = PROVIDERS.get(provider)
@@ -203,43 +202,72 @@ async def fetch_models(provider: str, api_key: str) -> list:
             return []
 
 # -------------------------------------------------------------------
-# Setup (adds Vertex + optional base URL input)
+# Show all models in paginated messages
+# -------------------------------------------------------------------
+async def show_all_models(ctx, models_list: list):
+    """Send all model IDs in batches, each message contains up to 50 models with global indices."""
+    if not models_list:
+        return await ctx.send("No models found.")
+    total = len(models_list)
+    # Create a single large text block, then split if needed
+    lines = []
+    for i, model_id in enumerate(models_list, 1):
+        lines.append(f"`{i}` - `{model_id}`")
+    full_text = "\n".join(lines)
+    # Discord message limit is 2000 chars; if we exceed, send in chunks
+    if len(full_text) <= 2000:
+        await ctx.send(f"**All {total} models:**\n{full_text}")
+    else:
+        # Split into chunks of 50 lines
+        chunk_size = 50
+        chunks = [lines[i:i+chunk_size] for i in range(0, len(lines), chunk_size)]
+        for idx, chunk in enumerate(chunks):
+            start_num = idx * chunk_size + 1
+            end_num = min(start_num + chunk_size - 1, total)
+            header = f"**Models {start_num}–{end_num} of {total}:**"
+            await ctx.send(header + "\n" + "\n".join(chunk))
+            await asyncio.sleep(0.5)  # avoid rate limits
+
+# -------------------------------------------------------------------
+# Interactive setup (all models, 5 min timeout)
 # -------------------------------------------------------------------
 @bot.command(name="setup")
 async def setup(ctx):
+    """Guide through choosing provider, setting API key, and picking a model."""
     uid = str(ctx.author.id)
     lines = ["**Choose your AI provider:**"]
     keys = list(PROVIDERS.keys())
     for i, key in enumerate(keys, 1):
         lines.append(f"`{i}` - {PROVIDERS[key]['name']}")
-    lines.append("Reply with the number.")
+    lines.append("Reply with the number (e.g., `1`).")
     await ctx.send("\n".join(lines))
 
     def check(m):
         return m.author == ctx.author and m.channel == ctx.channel and m.content.isdigit()
+
     try:
-        msg = await bot.wait_for("message", timeout=60.0, check=check)
+        msg = await bot.wait_for("message", timeout=120.0, check=check)
         choice = int(msg.content)
         if choice < 1 or choice > len(keys):
             return await ctx.send("Invalid choice. Run `!setup` again.")
         selected_provider = keys[choice - 1]
         prov_cfg = PROVIDERS[selected_provider]
 
-        # Vertex requires base URL
+        # Vertex requires base URL (optional, you can skip)
         if selected_provider == "vertex":
-            await ctx.send("Enter your Vertex AI base URL (e.g., https://us-central1-aiplatform.googleapis.com/v1/projects/.../locations/...):")
-            url_msg = await bot.wait_for("message", timeout=60.0, check=lambda m: m.author == ctx.author and m.channel == ctx.channel)
+            await ctx.send("Enter your Vertex AI base URL (e.g., https://...):")
+            url_msg = await bot.wait_for("message", timeout=120.0, check=lambda m: m.author == ctx.author and m.channel == ctx.channel)
             PROVIDERS["vertex"]["base_url"] = url_msg.content.strip()
             prov_cfg["base_url"] = url_msg.content.strip()
 
-        await ctx.send(f"✅ Selected **{prov_cfg['name']}**. Now send me your API key (use a DM for safety).")
-        msg = await bot.wait_for("message", timeout=120.0, check=lambda m: m.author == ctx.author and m.channel == ctx.channel)
+        await ctx.send(f"✅ Selected **{prov_cfg['name']}**. Now send me your API key (use a DM for safety). You have 5 minutes.")
+        msg = await bot.wait_for("message", timeout=300.0, check=lambda m: m.author == ctx.author and m.channel == ctx.channel)
         api_key = msg.content.strip()
         if ctx.guild:
             try: await msg.delete()
             except: pass
 
-        await ctx.send("🔍 Fetching available models…")
+        await ctx.send("🔍 Fetching all available models for your API key…")
         models = await fetch_models(selected_provider, api_key)
         if not models:
             default_model = prov_cfg["default_model"]
@@ -248,70 +276,69 @@ async def setup(ctx):
             return await ctx.send(f"⚠️ Could not fetch model list. Using default model: `{default_model}`. Change later with `!models`.")
 
         models_sorted = sorted(models)
-        display = models_sorted[:20]
-        lines = ["**Select a model:**"]
-        for i, m in enumerate(display, 1):
-            lines.append(f"`{i}` - `{m}`")
-        if len(models_sorted) > 20:
-            lines.append(f"... and {len(models_sorted) - 20} more. Type exact model ID.")
-        lines.append("Reply with number or model ID.")
-        await ctx.send("\n".join(lines))
+        # Show every model (paginated)
+        await show_all_models(ctx, models_sorted)
+        await ctx.send("Reply with the number from the list or the exact model ID. You have 5 minutes.")
 
         def model_check(m):
             return m.author == ctx.author and m.channel == ctx.channel
-        msg = await bot.wait_for("message", timeout=60.0, check=model_check)
+
+        msg = await bot.wait_for("message", timeout=300.0, check=model_check)
         choice_text = msg.content.strip()
+        chosen_model = None
         if choice_text.isdigit():
             idx = int(choice_text)
-            if 1 <= idx <= len(display):
-                chosen_model = display[idx - 1]
+            if 1 <= idx <= len(models_sorted):
+                chosen_model = models_sorted[idx - 1]
             else:
-                return await ctx.send("Invalid number. Setup cancelled.")
+                return await ctx.send("Invalid number. Setup cancelled. Run `!setup` again.")
         else:
-            chosen_model = choice_text
-            if chosen_model not in models_sorted:
-                return await ctx.send("Model not found. Setup cancelled.")
+            if choice_text in models_sorted:
+                chosen_model = choice_text
+            else:
+                return await ctx.send("Model ID not found. Setup cancelled.")
+
         user_data[uid] = {"provider": selected_provider, "api_key": api_key, "model": chosen_model, "current_project": None}
         save_user_data()
         await ctx.send(f"✅ Setup complete!\nProvider: **{prov_cfg['name']}**\nModel: `{chosen_model}`")
+
     except asyncio.TimeoutError:
-        await ctx.send("⌛ Setup timed out.")
+        await ctx.send("⌛ Setup timed out. Run `!setup` again.")
 
 # -------------------------------------------------------------------
-# !models, !setkey, !provider (unchanged except Vertex checks)
+# !models – show all models and let user switch (5 min timeout)
 # -------------------------------------------------------------------
 @bot.command(name="models")
 async def list_models(ctx):
+    """List all available models for your current provider and allow switching."""
     uid = str(ctx.author.id)
     if uid not in user_data or "api_key" not in user_data[uid]:
-        return await ctx.send("❌ Not set up. Use `!setup`.")
+        return await ctx.send("❌ You haven't set up a provider and API key. Use `!setup`.")
     provider = user_data[uid]["provider"]
     api_key = user_data[uid]["api_key"]
-    await ctx.send("🔍 Fetching models…")
+    await ctx.send("🔍 Fetching all models…")
     models = await fetch_models(provider, api_key)
     if not models:
-        return await ctx.send("❌ Could not retrieve models.")
+        return await ctx.send("❌ Could not retrieve models. Check your API key.")
     models_sorted = sorted(models)
-    display = models_sorted[:20]
-    lines = ["**Available models:**"]
-    for i, m in enumerate(display, 1):
-        current = " (current)" if m == user_data[uid].get("model") else ""
-        lines.append(f"`{i}` - `{m}`{current}")
-    if len(models_sorted) > 20:
-        lines.append("... and more. Type exact ID.")
-    lines.append("Reply with number/model ID or `cancel`.")
-    await ctx.send("\n".join(lines))
-    def check(m): return m.author == ctx.author and m.channel == ctx.channel
+    await show_all_models(ctx, models_sorted)
+    await ctx.send("Reply with the number from the list or the exact model ID to switch, or `cancel`. You have 5 minutes.")
+
+    def check(m):
+        return m.author == ctx.author and m.channel == ctx.channel
     try:
-        msg = await bot.wait_for("message", timeout=60.0, check=check)
+        msg = await bot.wait_for("message", timeout=300.0, check=check)
         choice = msg.content.strip()
-        if choice.lower() == "cancel": return
+        if choice.lower() == "cancel":
+            return await ctx.send("Cancelled.")
         chosen = None
         if choice.isdigit():
             idx = int(choice)
-            if 1 <= idx <= len(display): chosen = display[idx - 1]
+            if 1 <= idx <= len(models_sorted):
+                chosen = models_sorted[idx - 1]
         else:
-            if choice in models_sorted: chosen = choice
+            if choice in models_sorted:
+                chosen = choice
         if chosen:
             user_data[uid]["model"] = chosen
             save_user_data()
@@ -319,8 +346,11 @@ async def list_models(ctx):
         else:
             await ctx.send("Invalid selection.")
     except asyncio.TimeoutError:
-        await ctx.send("Timed out.")
+        await ctx.send("⌛ Timed out.")
 
+# -------------------------------------------------------------------
+# !setkey, !provider (unchanged)
+# -------------------------------------------------------------------
 @bot.command(name="setkey")
 async def set_key(ctx, *, key: str):
     uid = str(ctx.author.id)
@@ -346,7 +376,7 @@ async def show_provider(ctx):
         await ctx.send("Not set up.")
 
 # -------------------------------------------------------------------
-# !ask (server aware, now with online member names)
+# !ask – server aware, shows online member names (intent needed)
 # -------------------------------------------------------------------
 SERVER_KEYWORDS = [
     "server", "guild", "member", "owner", "moderator", "admin",
@@ -400,7 +430,7 @@ async def ask_question(ctx, *, question: str):
             await ctx.send(f"❌ Error: {str(e)}")
 
 # -------------------------------------------------------------------
-# !newproject, !listfiles, !viewfile, !setproject, !listprojects (unchanged)
+# !newproject, !listfiles, !viewfile, !setproject, !listprojects
 # -------------------------------------------------------------------
 @bot.command(name="newproject")
 async def new_project(ctx):
@@ -460,7 +490,7 @@ async def list_projects(ctx):
     await ctx.send("\n".join(lines))
 
 # -------------------------------------------------------------------
-# !make (now supports any language, Unsplash, multi-page)
+# !make (multi-language, Unsplash images, multi-page)
 # -------------------------------------------------------------------
 @bot.command(name="make")
 async def make_website(ctx, *, description: str):
@@ -522,9 +552,6 @@ async def make_website(ctx, *, description: str):
             },
         },
     ]
-
-    # Determine if it's a website request
-    is_web = any(kw in description.lower() for kw in ["website", "webpage", "html", "site", "page"])
 
     system_prompt = (
         "You are an expert software developer. Create the project according to the user's request.\n\n"
@@ -651,11 +678,10 @@ async def attach_image(ctx, *, description: str = ""):
     if uid not in user_data: return await ctx.send("Set up provider first.")
     client = get_user_client(uid)
     if not client: return await ctx.send("Provider error.")
-    # Find a vision model from user's provider (simple check: model name contains 'vision')
     provider = user_data[uid]["provider"]
     model = get_user_model(uid)
+    # Try to switch to a vision model if available
     if "vision" not in model.lower() and "gemini" not in model.lower() and "gpt-4" not in model.lower():
-        # Try to switch to a vision model automatically
         models = await fetch_models(provider, user_data[uid]["api_key"])
         vision_candidates = [m for m in models if ("vision" in m.lower() or "gemini" in m.lower() or "gpt-4" in m.lower())]
         if vision_candidates:
@@ -663,7 +689,6 @@ async def attach_image(ctx, *, description: str = ""):
             await ctx.send(f"ℹ️ Switching to vision model `{model}` for this request.")
         else:
             return await ctx.send("❌ Your provider has no vision model. Use `!models` to pick one.")
-    # Download image
     attachment = ctx.message.attachments[0]
     image_bytes = await attachment.read()
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
@@ -676,8 +701,8 @@ async def attach_image(ctx, *, description: str = ""):
     async with ctx.typing():
         try:
             resp = await client.chat.completions.create(model=model, messages=messages, temperature=0.7)
-            # Now call !make with the AI's description (reuse the make logic)
             ai_plan = resp.choices[0].message.content
+            # Reuse the make command with the AI's generated description
             await ctx.invoke(bot.get_command("make"), description=ai_plan)
         except Exception as e:
             await ctx.send(f"❌ Error: {e}")
@@ -691,7 +716,6 @@ async def generate_image(ctx, *, prompt: str):
     client = get_user_client(uid)
     if not client: return await ctx.send("Set up provider first.")
     try:
-        # Try OpenAI Images endpoint; if fails, tell user
         resp = await client.images.generate(model="dall-e-2", prompt=prompt, n=1, size="512x512")
         image_url = resp.data[0].url
         await ctx.send(f"🖼️ Generated: {image_url}")
@@ -706,7 +730,6 @@ async def search_web(ctx, *, query: str):
     uid = str(ctx.author.id)
     client = get_user_client(uid)
     if not client: return await ctx.send("Set up provider first.")
-    # Fetch from DuckDuckGo instant answer + web results
     url = f"https://api.duckduckgo.com/?q={query}&format=json&no_html=1"
     async with aiohttp.ClientSession() as session:
         try:
@@ -727,8 +750,6 @@ async def search_web(ctx, *, query: str):
                     return await ctx.send("No results.")
         except Exception as e:
             return await ctx.send(f"Search error: {e}")
-
-    # Use AI to filter and answer
     model = get_user_model(uid)
     messages = [
         {"role": "system", "content": "You are a search assistant. Use the provided search results to answer the user's question concisely, filtering out irrelevant info."},
@@ -748,26 +769,17 @@ async def search_web(ctx, *, query: str):
 async def on_message(message):
     if message.author.bot:
         return
-    # Allow splitting by ' && ' if message starts with '!'
     if message.content.startswith("!") and " && " in message.content:
-        parts = message.content.split(" && ")
+        parts = [p.strip() for p in message.content.split(" && ")]
         for part in parts:
-            part = part.strip()
-            # Create a new message-like context but better to just invoke command
-            # Simulate a message with the content of the part
-            fake_message = discord.Message(
-                channel=message.channel,
-                author=message.author,
-                content=part,
-                id=message.id,
-                # need minimal init; not perfect but works for simple commands
-            )
-            # Actually, we can just use bot.process_commands with a modified message.
-            # Simple approach: set message.content = part and call process_commands
-            original = message.content
-            message.content = part
-            await bot.process_commands(message)
-            message.content = original
+            if part:
+                # Create a copy of the message with modified content
+                # We can't easily create a new message, but we can call process_commands directly
+                # by modifying the message's content temporarily (safe)
+                original = message.content
+                message.content = part
+                await bot.process_commands(message)
+                message.content = original
         return
     await bot.process_commands(message)
 
