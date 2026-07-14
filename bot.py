@@ -143,6 +143,16 @@ async def on_ready():
     await startup_cleanup()
 
 # -------------------------------------------------------------------
+# Global error handler (shows user what went wrong)
+# -------------------------------------------------------------------
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.CommandNotFound):
+        return
+    await ctx.send(f"❌ Error: {str(error)}")
+    print(f"Error in {ctx.command}: {error}")
+
+# -------------------------------------------------------------------
 # Helpers
 # -------------------------------------------------------------------
 def get_user_client(uid: str):
@@ -189,11 +199,9 @@ async def fetch_image_models(provider: str, api_key: str) -> list:
                     if resp.status != 200:
                         return []
                     data = await resp.json()
-                    # Filter models that support images
                     return [m["id"] for m in data.get("data", []) if "image" in m.get("capabilities", [])]
             except:
                 return []
-    # For other providers, return hardcoded model list
     return [IMAGE_PROVIDERS[provider]["default_model"]]
 
 async def show_all_models(ctx, models: list):
@@ -218,9 +226,8 @@ async def show_all_models(ctx, models: list):
 # -------------------------------------------------------------------
 @bot.command(name="help")
 async def help_command(ctx):
-    """Show all available commands."""
-    help_text = """
-**Available Commands:**
+    await ctx.send("""
+**Available Commands**
 `!setup` – Configure chat + image generation
 `!models` – Switch chat model
 `!setkey <key>` – Update API key
@@ -232,19 +239,18 @@ async def help_command(ctx):
 `!listprojects` – List all projects
 `!make <description>` – Build website/code
 `!edit <file> <instruction>` – Edit a file with AI
-`!attach [image] <description>` – Build from image
+`!attach [image] <description>` – Build from image (retries on credit errors)
 `!draw <prompt>` – Generate an image
 `!ask <question>` – Ask anything (server‑aware)
 `!search <query>` – Web search with AI filter
 `!imgsetup` – Configure image generation only
 `!imgmodels` – Switch image model
 `!devcleanup` – Admin wipe (password required)
-**Multi‑command:** use ` && ` between commands.
-"""
-    await ctx.send(help_text)
+Multi‑command: use ` && ` between commands.
+""")
 
 # -------------------------------------------------------------------
-# !setup (unchanged)
+# !setup (full, works in DMs)
 # -------------------------------------------------------------------
 @bot.command(name="setup")
 async def setup(ctx):
@@ -258,7 +264,7 @@ async def setup(ctx):
     def check(m):
         return m.author == ctx.author and m.channel == ctx.channel and m.content.isdigit()
     try:
-        msg = await bot.wait_for("message", timeout=120.0, check=check)
+        msg = await bot.wait_for("message", timeout=180.0, check=check)
         choice = int(msg.content)
         if choice < 1 or choice > len(keys):
             return await ctx.send("Invalid choice.")
@@ -267,7 +273,7 @@ async def setup(ctx):
 
         if provider == "vertex":
             await ctx.send("Enter Vertex AI base URL:")
-            url_msg = await bot.wait_for("message", timeout=120.0, check=lambda m: m.author == ctx.author and m.channel == ctx.channel)
+            url_msg = await bot.wait_for("message", timeout=180.0, check=lambda m: m.author == ctx.author and m.channel == ctx.channel)
             PROVIDERS["vertex"]["base_url"] = url_msg.content.strip()
             prov_cfg["base_url"] = url_msg.content.strip()
 
@@ -315,7 +321,7 @@ async def setup(ctx):
         def yes_no_check(m):
             return m.author == ctx.author and m.channel == ctx.channel and m.content.lower() in ("yes", "no")
         try:
-            img_choice = await bot.wait_for("message", timeout=120.0, check=yes_no_check)
+            img_choice = await bot.wait_for("message", timeout=180.0, check=yes_no_check)
         except asyncio.TimeoutError:
             return await ctx.send("Skipping image setup. Use `!imgsetup` later.")
         if img_choice.content.lower() == "no":
@@ -327,7 +333,7 @@ async def setup(ctx):
         for i, key in enumerate(img_keys, 1):
             img_lines.append(f"`{i}` - {IMAGE_PROVIDERS[key]['name']}")
         await ctx.send("\n".join(img_lines) + "\nReply with number.")
-        msg = await bot.wait_for("message", timeout=120.0, check=check)
+        msg = await bot.wait_for("message", timeout=180.0, check=check)
         img_choice_num = int(msg.content)
         if img_choice_num < 1 or img_choice_num > len(img_keys):
             return await ctx.send("Invalid choice. Image setup cancelled.")
@@ -335,7 +341,7 @@ async def setup(ctx):
         img_cfg = IMAGE_PROVIDERS[img_provider]
 
         await ctx.send(f"✅ Selected **{img_cfg['name']}**. Enter API key (or `skip` to use your OpenRouter key if available).")
-        key_msg = await bot.wait_for("message", timeout=120.0, check=lambda m: m.author == ctx.author and m.channel == ctx.channel)
+        key_msg = await bot.wait_for("message", timeout=180.0, check=lambda m: m.author == ctx.author and m.channel == ctx.channel)
         img_api_key = key_msg.content.strip()
         if img_api_key.lower() == "skip":
             if img_provider == "openrouter" and "api_key" in user_data.get(uid, {}):
@@ -379,7 +385,7 @@ async def setup(ctx):
         await ctx.send("⌛ Setup timed out.")
 
 # -------------------------------------------------------------------
-# !imgsetup, !imgmodels
+# !imgsetup (works in DMs)
 # -------------------------------------------------------------------
 @bot.command(name="imgsetup")
 async def img_setup(ctx):
@@ -393,14 +399,14 @@ async def img_setup(ctx):
     def check(m):
         return m.author == ctx.author and m.channel == ctx.channel and m.content.isdigit()
     try:
-        msg = await bot.wait_for("message", timeout=120.0, check=check)
+        msg = await bot.wait_for("message", timeout=180.0, check=check)
         choice = int(msg.content)
         if choice < 1 or choice > len(img_keys):
             return await ctx.send("Invalid choice.")
         img_provider = img_keys[choice-1]
         img_cfg = IMAGE_PROVIDERS[img_provider]
         await ctx.send(f"Selected **{img_cfg['name']}**. Enter API key (or `skip` to use existing key).")
-        key_msg = await bot.wait_for("message", timeout=120.0, check=lambda m: m.author == ctx.author and m.channel == ctx.channel)
+        key_msg = await bot.wait_for("message", timeout=180.0, check=lambda m: m.author == ctx.author and m.channel == ctx.channel)
         api_key = key_msg.content.strip()
         if api_key.lower() == "skip" and img_provider == "openrouter" and "api_key" in user_data[uid]:
             api_key = user_data[uid]["api_key"]
@@ -439,6 +445,9 @@ async def img_setup(ctx):
     except asyncio.TimeoutError:
         await ctx.send("⌛ Timed out.")
 
+# -------------------------------------------------------------------
+# !imgmodels (works in DMs)
+# -------------------------------------------------------------------
 @bot.command(name="imgmodels")
 async def list_img_models(ctx):
     uid = str(ctx.author.id)
@@ -475,7 +484,7 @@ async def list_img_models(ctx):
         await ctx.send("Timed out.")
 
 # -------------------------------------------------------------------
-# !draw (FIXED)
+# !draw (no file stored, prompt enhancement, clear status)
 # -------------------------------------------------------------------
 @bot.command(name="draw")
 async def draw_image(ctx, *, prompt: str):
@@ -487,7 +496,7 @@ async def draw_image(ctx, *, prompt: str):
     model = user_data[uid].get("image_model", IMAGE_PROVIDERS[provider]["default_model"])
     cfg = IMAGE_PROVIDERS[provider]
 
-    # Enhance prompt using chat model (with fallback)
+    # Enhance prompt (fallback to original)
     enhanced_prompt = prompt
     client = get_user_client(uid)
     if client:
@@ -551,7 +560,7 @@ async def draw_image(ctx, *, prompt: str):
                 await ctx.send(f"❌ Image generation failed: {e}")
 
 # -------------------------------------------------------------------
-# !attach (FIXED – extreme token limit)
+# !attach (with retry on credit limit)
 # -------------------------------------------------------------------
 @bot.command(name="attach")
 async def attach_image(ctx, *, description: str = ""):
@@ -566,7 +575,7 @@ async def attach_image(ctx, *, description: str = ""):
     model = get_user_model(uid)
     attachment = ctx.message.attachments[0]
     if attachment.size > 500_000:
-        await ctx.send("⚠️ Image is large; consider compressing to under 500KB to avoid credit issues.")
+        await ctx.send("⚠️ Image is large; consider compressing to under 500KB.")
 
     # Try to switch to a vision model if needed
     if "vision" not in model.lower() and "gemini" not in model.lower() and "gpt-4" not in model.lower():
@@ -584,26 +593,32 @@ async def attach_image(ctx, *, description: str = ""):
         {"type": "text", "text": f"Build a website based on this image. {description}"},
         {"type": "image_url", "image_url": {"url": f"data:{attachment.content_type};base64,{image_b64}"}}
     ]}]
-    async with ctx.typing():
-        try:
-            # Force extremely low token limit to avoid huge credit consumption
-            resp = await client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=0.7,
-                max_tokens=512,  # ← strict limit
-            )
-            ai_plan = resp.choices[0].message.content
-            await ctx.invoke(bot.get_command("make"), description=ai_plan)
-        except Exception as e:
-            if "402" in str(e) or "credits" in str(e):
-                await ctx.send("❌ Not enough credits or image too large. Try a smaller image.")
-            else:
-                await ctx.send(f"❌ Error: {e}")
+
+    # Retry up to 3 times with 30s wait on credit errors
+    for attempt in range(3):
+        async with ctx.typing():
+            try:
+                resp = await client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    temperature=0.7,
+                    max_tokens=256,   # extremely low to avoid credit blowout
+                )
+                ai_plan = resp.choices[0].message.content
+                return await ctx.invoke(bot.get_command("make"), description=ai_plan)
+            except Exception as e:
+                error_str = str(e)
+                if "402" in error_str and "credits" in error_str:
+                    if attempt == 2:
+                        return await ctx.send("❌ Still out of credits after 3 attempts. Please try a smaller image or add credits.")
+                    await ctx.send(f"⏳ Credit limit hit, waiting 30 seconds (attempt {attempt+1}/3)...")
+                    await asyncio.sleep(30)
+                else:
+                    return await ctx.send(f"❌ Error: {e}")
 
 # -------------------------------------------------------------------
 # Other commands (!models, !setkey, !provider, !ask, projects, !make, !edit, !search, multi-command, devcleanup)
-# (same as before, I'll include them for completeness)
+# (All remaining commands unchanged, included for completeness)
 # -------------------------------------------------------------------
 @bot.command(name="models")
 async def list_models(ctx):
@@ -959,7 +974,7 @@ async def on_message(message):
     await bot.process_commands(message)
 
 # -------------------------------------------------------------------
-# Admin cleanup
+# Admin cleanup (now also deletes any temp files in workspace)
 # -------------------------------------------------------------------
 @bot.command(name="devcleanup")
 async def dev_cleanup(ctx):
@@ -972,12 +987,17 @@ async def dev_cleanup(ctx):
     try:
         msg = await bot.wait_for("message", timeout=30.0, check=check)
         if msg.content == ADMIN_PASSWORD:
+            # Delete all projects
             for folder in list(workspace_meta.keys()):
                 await delete_project(folder)
+            # Delete any stray files in workspace root
+            for item in WORKSPACE_DIR.iterdir():
+                if item.is_file():
+                    item.unlink()
             for uid in user_data:
                 user_data[uid]["current_project"] = None
             save_user_data()
-            await ctx.author.send("🗑️ All projects wiped.")
+            await ctx.author.send("🗑️ All projects and temporary files wiped.")
         else:
             await ctx.author.send("❌ Wrong password.")
     except asyncio.TimeoutError:
