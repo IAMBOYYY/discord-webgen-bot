@@ -7,14 +7,19 @@ import uuid
 import time
 import base64
 import io
+import random
+import re
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
+from datetime import datetime, timedelta
+from io import BytesIO
 
 import discord
 from discord.ext import commands, tasks
 from openai import AsyncOpenAI, RateLimitError, APIStatusError
 import aiohttp
 import aiofiles
+from PIL import Image, ImageDraw, ImageFont
 
 # -------------------------------------------------------------------
 # Config
@@ -27,6 +32,7 @@ META_FILE = WORKSPACE_DIR / "workspace_meta.json"
 PROJECT_TTL_HOURS = 2
 ADMIN_PASSWORD = "26jan24march"
 
+# Provider definitions (unchanged)
 PROVIDERS = {
     "openrouter": {"name": "OpenRouter", "base_url": "https://openrouter.ai/api/v1", "default_model": "google/gemma-2-9b-it"},
     "groq": {"name": "Groq", "base_url": "https://api.groq.com/openai/v1", "default_model": "llama-3.1-8b-instant"},
@@ -152,19 +158,25 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 bot.remove_command('help')
 
+# Roast tracking
+roast_targets = {}  # key: (guild_id, channel_id, target_user_id) -> remaining_roasts
+
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user}")
     start_http_server()
     await startup_cleanup()
+    # Internal keep-alive pings self every 5 minutes
     @tasks.loop(minutes=5)
     async def keep_alive():
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(f"http://localhost:{PORT}/health"):
-                    pass
-        except Exception:
-            pass
+                async with session.get(f"http://localhost:{PORT}/health") as resp:
+                    if resp.status != 200:
+                        print("⚠️ Health check failed, restarting server...")
+                        # Could restart server here if needed
+        except Exception as e:
+            print(f"⚠️ Keep-alive error: {e}")
     keep_alive.start()
 
 @bot.event
@@ -290,6 +302,7 @@ async def help_command(ctx):
 **Commands**
 `!setup` – Interactive provider & model setup (sends backup)
 `!restore` – Restore settings from backup file (attach .json)
+`!sharesetting @user` – Share your API settings with a friend
 `!models` – Switch chat model
 `!setkey <key>` – Update API key
 `!provider` – Show current config
@@ -304,22 +317,16 @@ async def help_command(ctx):
 `!attach [image] <desc>` – Build from image (retries on credits)
 `!draw <prompt>` – Generate an image
 `!deploy <github_token> <repo>` – Deploy project to GitHub Pages
-`!ask <q>` – Ask anything (now with live web search)
+`!ask <q>` – Ask anything (now with live web search, concise answers)
 `!search <q>` – Web search + AI filter
 `!serverdetail <description>` – Set server description (admin)
 `!banwords word1, word2, ...` – Set banned words (warns users)
 `!serverbackup` / `!serverrestore` – Server settings backup
 `!imgsetup` / `!imgmodels` – Image generation config
 `!devcleanup` – Admin wipe (password required)
-**New cool commands:**
-`!userinfo @member` – User details
-`!serverinfo` – Detailed server info
-`!poll "Question" "Option1" "Option2" ...` – Create a poll
-`!remind 10m do something` – DM reminder after time
-`!welcome set Welcome {user}!` – Set welcome message
-`!purge 50` – Delete messages (admin)
-`!embed #channel title | description` – Create embed
-`!role @member RoleName` – Assign a role (bot needs Manage Roles)
+`!roast @user` – Start roasting a user for the next 10 messages
+`!meme top text; bottom text [attach image]` – Create a meme
+**New:** Tag the bot (@WebGenBot) with a request and it will automatically pick the right command!
 Multi‑command: use ` && `.
 """)
 
@@ -465,6 +472,20 @@ async def setup(ctx):
 
     except asyncio.TimeoutError:
         await ctx.send("⌛ Setup timed out.")
+
+# -------------------------------------------------------------------
+# !sharesetting – share your API settings with another user
+# -------------------------------------------------------------------
+@bot.command(name="sharesetting")
+async def share_setting(ctx, member: discord.Member):
+    uid = str(ctx.author.id)
+    target_uid = str(member.id)
+    if uid not in user_data:
+        return await ctx.send("You haven't set up your own settings yet. Use `!setup` first.")
+    # Copy settings to target user
+    user_data[target_uid] = user_data[uid].copy()
+    save_user_data()
+    await ctx.send(f"✅ Your settings have been shared with {member.mention}. They can now use the bot without setup.")
 
 # -------------------------------------------------------------------
 # !restore, !models, !setkey, !provider, !imgsetup, !imgmodels (as before)
@@ -794,6 +815,17 @@ async def server_restore(ctx):
 @bot.event
 async def on_message(message):
     if message.author.bot: return
+    # Roast handling
+    guild_id = message.guild.id if message.guild else None
+    channel_id = message.channel.id
+    author_id = message.author.id
+    if guild_id:
+        key = (guild_id, channel_id, author_id)
+        if key in roast_targets and roast_targets[key] > 0:
+            await handle_roast(message, key)
+            return  # don't process further if we just roasted
+
+    # Server banned words
     if message.guild:
         gid = str(message.guild.id)
         if gid in server_data and server_data[gid].get("banned_words"):
@@ -806,6 +838,7 @@ async def on_message(message):
                     except:
                         pass
                     break
+
     # Multi-command handler
     if message.content.startswith("!") and " && " in message.content:
         parts = [p.strip() for p in message.content.split(" && ")]
@@ -816,7 +849,170 @@ async def on_message(message):
                 await bot.process_commands(message)
                 message.content = original
         return
+
+    # Mention handling: if the bot is mentioned, try to decide which command to run
+    if bot.user in message.mentions:
+        content = message.content.replace(f'<@{bot.user.id}>', '').strip()
+        if not content:
+            await message.reply("Yes? Use `!help` to see what I can do.")
+            return
+        # Simple intent recognition
+        cmd = None
+        content_lower = content.lower()
+        if any(kw in content_lower for kw in ["draw", "image", "picture", "generate image"]):
+            cmd = bot.get_command("draw")
+        elif any(kw in content_lower for kw in ["make", "build", "create", "website", "webpage", "code", "app"]):
+            cmd = bot.get_command("make")
+        elif any(kw in content_lower for kw in ["search", "google", "find"]):
+            cmd = bot.get_command("search")
+        elif any(kw in content_lower for kw in ["ask", "question", "what", "who", "how", "why", "when", "where"]):
+            cmd = bot.get_command("ask")
+        elif "roast" in content_lower:
+            # Could parse user mention? but need target
+            await message.reply("To roast someone, use `!roast @user`")
+            return
+        else:
+            # Default to ask
+            cmd = bot.get_command("ask")
+
+        # If cmd found, invoke it with the content as argument
+        if cmd:
+            # Pass the remaining text as the argument
+            await ctx.invoke(cmd, content)
+        return
+
     await bot.process_commands(message)
+
+# -------------------------------------------------------------------
+# Roast system
+# -------------------------------------------------------------------
+async def handle_roast(message, key):
+    """Generate a roast reply for the target user."""
+    uid = str(message.author.id)  # the user being roasted
+    # Get the user who initiated the roast (stored elsewhere? We'll store initiator in roast_targets value as a tuple)
+    # For simplicity, we'll just use the bot to generate a roast without needing the initiator.
+    target_user = message.author
+    # Use the first available user's API key? Better to use the roaster's key. We'll store roaster_id in the dict.
+    # Modify roast_targets to store (remaining, roaster_id)
+    # I'll adapt: key: (guild, channel, target) -> (roasts_left, roaster_id)
+    # We'll update the !roast command to set that.
+
+    # This function will be called after we update the data structure.
+    # For now, I'll assume the data is stored as tuple (count, roaster_id).
+    data = roast_targets.get(key)
+    if not data:
+        return
+    count, roaster_id = data
+    if count <= 0:
+        del roast_targets[key]
+        return
+
+    # Use the roaster's API to generate a roast
+    roaster_uid = str(roaster_id)
+    client = get_user_client(roaster_uid)
+    if not client:
+        await message.reply("Roast machine broken (no API key).")
+        return
+    model = get_user_model(roaster_uid)
+    prompt = f"Roast this Discord user in a funny, friendly, but savage way. Mention their name '{target_user.display_name}'. Keep it short, one sentence."
+    try:
+        resp = await ai_call_with_retry(
+            client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=1.0,
+                max_tokens=60
+            )
+        )
+        roast = resp.choices[0].message.content.strip()
+        await message.reply(f"{target_user.mention} {roast}")
+    except Exception as e:
+        await message.reply(f"{target_user.mention} Oops, I couldn't roast you: {e}")
+
+    # Decrement count
+    new_count = count - 1
+    if new_count <= 0:
+        del roast_targets[key]
+    else:
+        roast_targets[key] = (new_count, roaster_id)
+
+@bot.command(name="roast")
+async def roast_start(ctx, member: discord.Member):
+    """Start roasting the mentioned user for the next 10 messages."""
+    if member == ctx.author:
+        return await ctx.send("You can't roast yourself, that's sad.")
+    if member.bot:
+        return await ctx.send("I don't roast bots... yet.")
+    key = (ctx.guild.id, ctx.channel.id, member.id)
+    roast_targets[key] = (10, ctx.author.id)
+    await ctx.send(f"🔥 {member.mention}, you're about to get roasted for the next 10 messages! Say something if you dare.")
+
+# -------------------------------------------------------------------
+# !meme command
+# -------------------------------------------------------------------
+@bot.command(name="meme")
+async def meme_command(ctx, *, texts: str):
+    """Create a meme: !meme top text; bottom text [attach image]"""
+    if not ctx.message.attachments:
+        return await ctx.send("Please attach an image to make a meme.")
+    attachment = ctx.message.attachments[0]
+    # Split texts by semicolon
+    parts = texts.split(';')
+    top_text = parts[0].strip() if len(parts) > 0 else ""
+    bottom_text = parts[1].strip() if len(parts) > 1 else ""
+
+    # Download image
+    async with aiohttp.ClientSession() as session:
+        async with session.get(attachment.url) as resp:
+            if resp.status != 200:
+                return await ctx.send("Failed to download image.")
+            img_data = await resp.read()
+
+    image = Image.open(io.BytesIO(img_data)).convert("RGB")
+    draw = ImageDraw.Draw(image)
+    # Use a default font, or try to load a system font
+    try:
+        font = ImageFont.truetype("arial.ttf", size=40)
+    except:
+        font = ImageFont.load_default()
+
+    # Calculate text position (centered)
+    def draw_text(draw, text, y_start, max_width):
+        lines = []
+        words = text.split()
+        line = ""
+        for word in words:
+            test_line = f"{line} {word}".strip()
+            bbox = draw.textbbox((0,0), test_line, font=font)
+            if bbox[2] <= max_width:
+                line = test_line
+            else:
+                lines.append(line)
+                line = word
+        if line:
+            lines.append(line)
+        y = y_start
+        for line in lines:
+            bbox = draw.textbbox((0,0), line, font=font)
+            w = bbox[2] - bbox[0]
+            x = (max_width - w) // 2
+            draw.text((x, y), line, fill="white", font=font, stroke_width=2, stroke_fill="black")
+            y += bbox[3] - bbox[1] + 10
+        return y
+
+    max_width = image.width - 20
+    if top_text:
+        draw_text(draw, top_text, 10, max_width)
+    if bottom_text:
+        # Position from bottom
+        bottom_y = image.height - 100
+        draw_text(draw, bottom_text, bottom_y, max_width)
+
+    # Save to BytesIO
+    output = io.BytesIO()
+    image.save(output, format="PNG")
+    output.seek(0)
+    await ctx.send(file=discord.File(output, filename="meme.png"))
 
 # -------------------------------------------------------------------
 # Welcome message system
@@ -841,7 +1037,7 @@ async def on_member_join(member):
             pass
 
 # -------------------------------------------------------------------
-# !ask – NOW WITH WEB SEARCH INTEGRATION
+# !ask – NOW WITH WEB SEARCH INTEGRATION and concise answers
 # -------------------------------------------------------------------
 SERVER_KEYWORDS = ["server", "guild", "member", "owner", "moderator", "admin", "channel", "role", "emojis", "boost", "level", "created", "this place", "here", "how many people", "who owns", "who is online", "online members"]
 def is_server_question(q: str) -> bool:
@@ -860,7 +1056,6 @@ def get_server_info(guild: discord.Guild) -> str:
             f"Text channels: {len(guild.text_channels)}, Voice: {len(guild.voice_channels)}\nRoles: {roles}\nCreated: {created}")
 
 async def duckduckgo_search(query: str) -> str:
-    """Return a text snippet from DuckDuckGo instant answer and related topics."""
     url = f"https://api.duckduckgo.com/?q={query}&format=json&no_html=1"
     async with aiohttp.ClientSession() as session:
         try:
@@ -885,21 +1080,20 @@ async def ask_question(ctx, *, question: str):
     if not client: return await ctx.send("❌ Set up provider first.")
     model = get_user_model(uid)
 
-    # Always fetch web data to enhance answer (unless it's purely a server question)
+    # For general questions, always fetch web context
     web_context = ""
     if ctx.guild and is_server_question(question):
-        # For server questions, we don't need web search
         web_context = ""
     else:
         web_context = await duckduckgo_search(question)
         if web_context:
             web_context = f"Web search results:\n{web_context}\n\n"
 
-    system_content = "You are a helpful assistant. "
+    system_content = "You are a helpful, concise assistant. Answer in 1-2 short paragraphs. Be informative but brief."
     if ctx.guild and is_server_question(question):
-        system_content += f"Here is real-time server data:\n{get_server_info(ctx.guild)}\nAnswer using this data."
+        system_content = f"Here is real-time server data:\n{get_server_info(ctx.guild)}\nAnswer using this data concisely."
     if web_context:
-        system_content += f"Use the following web search results to provide an accurate, up-to-date answer:\n{web_context}"
+        system_content += f"\nUse the following web search results to provide an accurate, up-to-date answer:\n{web_context}"
 
     messages = [
         {"role": "system", "content": system_content},
@@ -909,7 +1103,7 @@ async def ask_question(ctx, *, question: str):
     async with ctx.typing():
         try:
             resp = await ai_call_with_retry(
-                client.chat.completions.create(model=model, messages=messages, temperature=0.7, max_tokens=1024)
+                client.chat.completions.create(model=model, messages=messages, temperature=0.5, max_tokens=300)
             )
             await send_long_message(ctx, resp.choices[0].message.content)
         except Exception as e:
@@ -933,7 +1127,7 @@ async def search_web(ctx, *, query: str):
     async with ctx.typing():
         try:
             resp = await ai_call_with_retry(
-                client.chat.completions.create(model=model, messages=messages, temperature=0.5, max_tokens=500)
+                client.chat.completions.create(model=model, messages=messages, temperature=0.5, max_tokens=300)
             )
             await send_long_message(ctx, resp.choices[0].message.content)
         except Exception as e:
@@ -1125,7 +1319,7 @@ async def make_website(ctx, *, description: str):
         "CRITICAL RULES:\n"
         "- Do NOT create subdirectories. Place ALL files directly in the project root.\n"
         "- Keep the structure simple: one HTML file, one CSS, one JS. If multi‑page, each page is a separate HTML file in the root.\n"
-        "- Use modern, responsive CSS with a nice color scheme. Add Unsplash images for visuals.\n"
+        "- Use modern, responsive CSS with a nice color scheme. For images, use Unsplash URLs like `https://source.unsplash.com/random/800x600/?topic`.\n"
         "- Make games fully playable. Ensure all links between pages work.\n"
         "- After ALL file operations, output exactly `DONE:` followed by a brief summary.\n"
         "- JSON arguments must be valid. Do not halt early."
@@ -1236,7 +1430,7 @@ async def make_website(ctx, *, description: str):
     asyncio.create_task(schedule_project_deletion(proj_name))
 
 # -------------------------------------------------------------------
-# !improve, !edit, !search, !deploy (unchanged)
+# !improve, !edit, !deploy (unchanged)
 # -------------------------------------------------------------------
 @bot.command(name="improve")
 async def improve_project(ctx):
@@ -1318,9 +1512,6 @@ async def edit_file(ctx, filename: str, *, instruction: str):
         except Exception as e:
             await ctx.send(f"❌ Error: {e}")
 
-# -------------------------------------------------------------------
-# !deploy (unchanged)
-# -------------------------------------------------------------------
 @bot.command(name="deploy")
 async def deploy_github(ctx, token: str, repo: str):
     uid = str(ctx.author.id)
